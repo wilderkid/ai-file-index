@@ -15,6 +15,9 @@
 //! - [`mixed_match`] 不依赖预计算键，逐字符做"每个汉字可被 汉字/全拼/首字母 消费"的匹配，
 //!   因此组合上限只影响快速路径，不影响正确性。
 
+use std::collections::HashMap;
+
+use aifi_core::{NodeId, VolumeIndex};
 use pinyin::ToPinyinMulti;
 
 /// 每个汉字最多考虑的读音数。
@@ -62,6 +65,59 @@ impl PinyinKeys {
     /// 粗略的额外内存占用（字节），用于 `index_status` 统计。
     pub fn heap_bytes(&self) -> usize {
         self.full.iter().chain(&self.initials).map(|s| s.len()).sum()
+    }
+}
+
+/// 只为含汉字的名字保存拼音键的缓存。
+///
+/// 纯 ASCII 名字不占空间。增量更新时调用 [`PinyinCache::update`] 同步单个节点；
+/// 节点被删除后它的键会残留到下次 [`PinyinCache::build`]，查询时按 `NodeId` 取值，
+/// 残留键不会被命中。
+#[derive(Debug, Default, Clone)]
+pub struct PinyinCache {
+    keys: HashMap<NodeId, PinyinKeys>,
+}
+
+impl PinyinCache {
+    /// 扫描整个索引，为每个含汉字的存活节点生成键。
+    pub fn build(idx: &VolumeIndex) -> Self {
+        let mut cache = Self::default();
+        for (id, _) in idx.iter() {
+            cache.update(idx, id);
+        }
+        cache
+    }
+
+    /// 按节点当前名字刷新一条缓存：含汉字则重算，否则移除。
+    pub fn update(&mut self, idx: &VolumeIndex, id: NodeId) {
+        match keys_for(idx.name(id)) {
+            Some(k) => {
+                self.keys.insert(id, k);
+            }
+            None => {
+                self.keys.remove(&id);
+            }
+        }
+    }
+
+    /// 取一个节点的拼音键；纯 ASCII 或未建缓存时返回 `None`。
+    pub fn get(&self, id: NodeId) -> Option<&PinyinKeys> {
+        self.keys.get(&id)
+    }
+
+    /// 缓存的节点数。
+    pub fn len(&self) -> usize {
+        self.keys.len()
+    }
+
+    /// 缓存是否为空。
+    pub fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
+
+    /// 全部键占用的堆内存（字节），供 `index_status` 报告。
+    pub fn heap_bytes(&self) -> usize {
+        self.keys.values().map(PinyinKeys::heap_bytes).sum()
     }
 }
 
@@ -193,6 +249,57 @@ mod tests {
         for q in ["bgjd", "xyz", "季报"] {
             assert!(!mixed_match(n, q), "query {q:?} should NOT match");
         }
+    }
+
+    #[test]
+    fn cache_keeps_only_han_names() {
+        use aifi_core::{FileRecord, FileRef, FsKind, VolumeId, VolumeInfo};
+
+        let mut idx = VolumeIndex::new(VolumeInfo {
+            id: VolumeId(0),
+            mount: "C:".into(),
+            fs: FsKind::Ntfs,
+            serial: 1,
+            root: FileRef::NTFS_ROOT,
+        });
+        let han = idx
+            .insert(&FileRecord {
+                file_ref: FileRef(10),
+                parent: FileRef::NTFS_ROOT,
+                name: "季度报告.xlsx".into(),
+                is_dir: false,
+                size: None,
+                modified: None,
+            })
+            .unwrap();
+        let ascii = idx
+            .insert(&FileRecord {
+                file_ref: FileRef(11),
+                parent: FileRef::NTFS_ROOT,
+                name: "main.rs".into(),
+                is_dir: false,
+                size: None,
+                modified: None,
+            })
+            .unwrap();
+
+        let mut cache = PinyinCache::build(&idx);
+        assert_eq!(cache.len(), 1);
+        assert!(cache.get(han).unwrap().initials.iter().any(|s| s == "jdbg.xlsx"));
+        assert_eq!(cache.get(ascii), None);
+        assert!(cache.heap_bytes() > 0);
+
+        idx.insert(&FileRecord {
+            file_ref: FileRef(10),
+            parent: FileRef::NTFS_ROOT,
+            name: "renamed.rs".into(),
+            is_dir: false,
+            size: None,
+            modified: None,
+        })
+        .unwrap();
+        cache.update(&idx, han);
+        assert!(cache.is_empty(), "重命名为纯 ASCII 后应移出缓存");
     }
 
     #[test]

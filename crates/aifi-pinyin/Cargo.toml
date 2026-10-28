@@ -7,6 +7,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+aifi-core.workspace = true
 pinyin.workspace = true
 
 [lints]
