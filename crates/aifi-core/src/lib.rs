@@ -14,7 +14,7 @@ pub mod source;
 pub mod types;
 
 pub use arena::{NameRef, StringArena};
-pub use index::{NodeId, VolumeIndex};
+pub use index::{MemoryStats, NodeId, VolumeIndex};
 pub use source::{SnapshotStore, VolumeSource, build_index, catch_up};
 pub use types::*;
 
