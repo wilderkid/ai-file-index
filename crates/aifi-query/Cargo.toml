@@ -12,9 +12,14 @@ aifi-pinyin.workspace = true
 aifi-project.workspace = true
 aifi-protocol.workspace = true
 memchr.workspace = true
+rayon.workspace = true
 globset.workspace = true
 regex.workspace = true
 thiserror.workspace = true
+nucleo-matcher = "0.3.1"
+
+[dev-dependencies]
+aifi-harness.workspace = true
 
 [lints]
 workspace = true

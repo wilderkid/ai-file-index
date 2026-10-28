@@ -28,6 +28,9 @@ pub mod flags {
 pub struct Node {
     pub file_ref: FileRef,
     pub parent: FileRef,
+    /// 父节点下标。`u32::MAX` 表示父节点尚未出现（枚举时子可能先于父到达），
+    /// 或父就是卷根。用下标而不是每次哈希查找，是为了让全路径拼接在百万级条目上够快。
+    pub parent_id: u32,
     pub name: NameRef,
     pub flags: u8,
     /// 文件大小（字节）。[`Self::SIZE_UNKNOWN`] 表示数据源未提供。
@@ -110,6 +113,11 @@ impl VolumeIndex {
         self.by_ref.len()
     }
 
+    /// 节点表长度（含墓碑）。下标 `0..node_count()` 都是合法的 [`NodeId`]。
+    pub fn node_count(&self) -> usize {
+        self.nodes.len()
+    }
+
     pub fn arena(&self) -> &StringArena {
         &self.arena
     }
@@ -140,10 +148,20 @@ impl VolumeIndex {
 
         self.by_ref.clear();
         self.children.clear();
-        for (i, n) in live.iter().enumerate() {
+        for (i, n) in live.iter_mut().enumerate() {
+            n.parent_id = u32::MAX;
             let id = NodeId(i as u32);
             self.by_ref.insert(n.file_ref, id);
             self.children.entry(n.parent).or_default().push(id);
+        }
+        let parents: Vec<(u32, u32)> = live
+            .iter()
+            .enumerate()
+            .filter_map(|(i, n)| self.children.get(&n.file_ref).map(|kids| (i as u32, kids.clone())))
+            .flat_map(|(pid, kids)| kids.into_iter().map(move |k| (k.0, pid)))
+            .collect();
+        for (kid, pid) in parents {
+            live[kid as usize].parent_id = pid;
         }
         self.nodes = live;
         Ok(())
@@ -156,9 +174,11 @@ impl VolumeIndex {
     /// NTFS 的多链接语义留到后续里程碑。
     pub fn insert(&mut self, rec: &FileRecord) -> Result<NodeId> {
         let name = self.arena.push(&rec.name)?;
+        let parent_id = self.by_ref.get(&rec.parent).map(|p| p.0).unwrap_or(u32::MAX);
         let node = Node {
             file_ref: rec.file_ref,
             parent: rec.parent,
+            parent_id,
             name,
             flags: if rec.is_dir { flags::DIR } else { 0 },
             size: rec.size.unwrap_or(Node::SIZE_UNKNOWN),
@@ -178,6 +198,12 @@ impl VolumeIndex {
         self.nodes.push(node);
         self.by_ref.insert(rec.file_ref, id);
         self.link_child(rec.parent, id);
+        // 先于父到达的子节点此刻才能补上父下标。
+        if let Some(kids) = self.children.get(&rec.file_ref) {
+            for kid in kids.clone() {
+                self.nodes[kid.0 as usize].parent_id = id.0;
+            }
+        }
         Ok(id)
     }
 
@@ -220,16 +246,21 @@ impl VolumeIndex {
     /// 父节点缺失（孤儿）时返回 `None`。
     pub fn full_path(&self, id: NodeId) -> Option<String> {
         let mut parts: Vec<&str> = Vec::new();
-        let mut cur = self.node(id);
         let root = self.info.root;
         let mut depth = 0;
-        while cur.file_ref != root {
+        let mut cur_id = Some(id);
+        while let Some(cid) = cur_id {
+            let cur = self.node(cid);
+            if cur.file_ref == root {
+                break;
+            }
             parts.push(self.arena.get(cur.name));
             if cur.parent == root {
                 break;
             }
-            let pid = self.by_ref.get(&cur.parent)?;
-            cur = self.node(*pid);
+            // 父下标缺失说明父节点还没到（孤儿），或数据损坏。
+            cur_id = (cur.parent_id != u32::MAX).then_some(NodeId(cur.parent_id));
+            cur_id?;
             depth += 1;
             if depth > MAX_DEPTH {
                 return None;
