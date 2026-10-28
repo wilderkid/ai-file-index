@@ -239,13 +239,13 @@ pub fn search_volume(idx: &VolumeIndex, q: &CompiledQuery, ctx: &QueryContext<'_
             continue;
         }
         total += 1;
-        let s = score(kind, tier, name.chars().count(), node.modified);
+        let s = score(kind, tier, name.chars().count(), node.modified());
         hits.push(Hit {
             node: id,
             path,
             is_dir: node.is_dir(),
-            modified: node.modified,
-            size: node.size,
+            modified: node.modified(),
+            size: node.size(),
             kind,
             tier,
             score: s,

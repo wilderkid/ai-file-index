@@ -24,10 +24,12 @@ use aifi_core::{
 pub struct FakeVolume {
     info: VolumeInfo,
     next_ref: u64,
-    /// 当前"磁盘"状态：FRN → 记录。
+    /// 当前"磁盘"状态：FRN → 记录。硬链接只保留最后写入的那条（见 [`Self::hardlink`]）。
     files: HashMap<FileRef, FileRecord>,
-    /// (父, 小写名) → FRN，用于按路径定位。
+    /// (父, 小写名) → FRN，用于按路径定位。一个 FRN 可以出现在多个键下（硬链接）。
     by_name: HashMap<(FileRef, String), FileRef>,
+    /// 每个 FRN 的全部链接（父, 原始大小写名）。
+    links: HashMap<FileRef, Vec<(FileRef, String)>>,
     journal: Vec<ChangeEvent>,
     journal_id: u64,
     /// 日志里最早仍保留的 USN（模拟截断）。
@@ -48,6 +50,7 @@ impl FakeVolume {
             next_ref: 100,
             files: HashMap::new(),
             by_name: HashMap::new(),
+            links: HashMap::new(),
             journal: Vec::new(),
             journal_id: 1,
             first_usn: 0,
@@ -105,6 +108,7 @@ impl FakeVolume {
             },
         );
         self.by_name.insert((parent, name.to_lowercase()), r);
+        self.links.entry(r).or_default().push((parent, name.to_string()));
         if log {
             self.log(ChangeKind::Created, r);
         }
@@ -132,6 +136,38 @@ impl FakeVolume {
         self.mkpath(path, true)
     }
 
+    /// 为已存在的文件再添加一个硬链接（同一 FRN，新的父目录与名字）。
+    ///
+    /// 与 NTFS 一致，链接目标必须是文件而不是目录。`aifi-core` 的索引在 v1 里
+    /// 对同一 FRN 只保留最后一条记录，因此索引侧看到的是一次移动；本方法在假卷上
+    /// 保留全部链接（见 [`Self::link_count`]），供测试验证这一取舍。
+    pub fn hardlink(&mut self, from: &str, new_path: &str) -> FileRef {
+        let r = self.lookup(from).expect("hardlink source exists");
+        assert!(!self.files[&r].is_dir, "hardlink target must be a file");
+        let parts = Self::split(new_path);
+        let (name, dirs) = parts.split_last().expect("non-empty link path");
+        let parent = self.lookup(&dirs.join("\\")).expect("link parent exists");
+        self.by_name.insert((parent, name.to_lowercase()), r);
+        self.links.entry(r).or_default().push((parent, (*name).to_string()));
+        let rec = self.files.get_mut(&r).expect("hardlink source record");
+        rec.parent = parent;
+        rec.name = (*name).to_string();
+        self.log(ChangeKind::Renamed, r);
+        r
+    }
+
+    /// 一个 FRN 当前的链接数（无硬链接时为 1）。
+    pub fn link_count(&self, r: FileRef) -> usize {
+        self.links.get(&r).map_or(0, Vec::len)
+    }
+
+    /// 把整个目录移动到新路径（只产生一条目录本身的重命名记录，与 USN 行为一致）。
+    pub fn move_dir(&mut self, from: &str, new_path: &str) {
+        let r = self.lookup(from).expect("move_dir source exists");
+        assert!(self.files[&r].is_dir, "move_dir source must be a directory");
+        self.rename(from, new_path);
+    }
+
     /// 重命名或移动到 `new_path`（目标父目录必须存在）。
     pub fn rename(&mut self, from: &str, new_path: &str) {
         let r = self.lookup(from).expect("rename source exists");
@@ -140,6 +176,10 @@ impl FakeVolume {
         let parent = self.lookup(&dirs.join("\\")).expect("target parent exists");
         let old = self.files[&r].clone();
         self.by_name.remove(&(old.parent, old.name.to_lowercase()));
+        if let Some(links) = self.links.get_mut(&r) {
+            links.retain(|(p, n)| !(*p == old.parent && n.eq_ignore_ascii_case(&old.name)));
+            links.push((parent, (*name).to_string()));
+        }
         let rec = self.files.get_mut(&r).unwrap();
         rec.parent = parent;
         rec.name = (*name).to_string();
@@ -160,6 +200,9 @@ impl FakeVolume {
         }
         self.log(ChangeKind::Deleted, r);
         let rec = self.files.remove(&r).unwrap();
+        for (parent, name) in self.links.remove(&r).unwrap_or_default() {
+            self.by_name.remove(&(parent, name.to_lowercase()));
+        }
         self.by_name.remove(&(rec.parent, rec.name.to_lowercase()));
     }
 
@@ -184,6 +227,35 @@ impl FakeVolume {
 
     pub fn file_count(&self) -> usize {
         self.files.len()
+    }
+
+    /// 生成一个包含 `n` 个条目的合成卷，用于规模与性能验证。
+    ///
+    /// 结构是一棵宽目录树（目录与文件约 1:7），名字由 `seed` 决定，
+    /// 因此相同参数总是产生相同的卷。不写日志。
+    pub fn synthetic(n: usize, seed: u64) -> Self {
+        let mut v = Self::new("C:");
+        if n == 0 {
+            return v;
+        }
+        let mut state = seed | 1;
+        let mut next = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            state
+        };
+
+        let root = v.info.root;
+        let mut dirs = vec![root];
+        while v.file_count() < n {
+            let parent = dirs[(next() as usize) % dirs.len()];
+            let name = format!("f{:016x}", next());
+            let make_dir = v.file_count() + 64 < n && next() % 8 == 0;
+            let r = v.create(parent, &name, make_dir, false);
+            if make_dir {
+                dirs.push(r);
+            }
+        }
+        v
     }
 }
 
