@@ -1,0 +1,268 @@
+//! 单卷节点表：定长节点 + FRN → 节点的映射 + 按父链重建路径。
+
+use std::collections::HashMap;
+
+use crate::Result;
+use crate::arena::{NameRef, StringArena};
+use crate::types::{ChangeEvent, ChangeKind, FileRecord, FileRef, VolumeInfo};
+
+/// 节点在 [`VolumeIndex`] 里的下标。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct NodeId(pub u32);
+
+/// 节点标志位。
+pub mod flags {
+    pub const DIR: u8 = 1 << 0;
+    /// 已删除（墓碑）。删除只打标，压缩时回收。
+    pub const DELETED: u8 = 1 << 1;
+}
+
+/// 定长节点记录。**不存路径**。
+///
+/// M1 可以把 `parent: FileRef` 优化成 `NodeId` 以省掉哈希查找，
+/// 但必须处理"子节点先于父节点到达"的枚举顺序。
+#[derive(Debug, Clone, Copy)]
+pub struct Node {
+    pub file_ref: FileRef,
+    pub parent: FileRef,
+    pub name: NameRef,
+    pub flags: u8,
+    pub size: Option<u64>,
+    pub modified: Option<i64>,
+    /// 所属项目 id（由 aifi-project 在后处理阶段填写；0 = 不属于任何项目）。
+    pub project: u32,
+}
+
+impl Node {
+    pub fn is_dir(&self) -> bool {
+        self.flags & flags::DIR != 0
+    }
+    pub fn is_deleted(&self) -> bool {
+        self.flags & flags::DELETED != 0
+    }
+}
+
+/// 一个卷的完整内存索引。
+#[derive(Debug)]
+pub struct VolumeIndex {
+    info: VolumeInfo,
+    arena: StringArena,
+    nodes: Vec<Node>,
+    by_ref: HashMap<FileRef, NodeId>,
+}
+
+/// 防止父链出现环（损坏数据）时死循环。
+const MAX_DEPTH: usize = 4096;
+
+impl VolumeIndex {
+    pub fn new(info: VolumeInfo) -> Self {
+        Self { info, arena: StringArena::new(), nodes: Vec::new(), by_ref: HashMap::new() }
+    }
+
+    pub fn info(&self) -> &VolumeInfo {
+        &self.info
+    }
+
+    /// 存活（未删除）节点数。
+    pub fn live_count(&self) -> usize {
+        self.by_ref.len()
+    }
+
+    pub fn arena(&self) -> &StringArena {
+        &self.arena
+    }
+
+    /// 插入或覆盖一条记录（同一 FRN 再次插入视为更新）。
+    pub fn insert(&mut self, rec: &FileRecord) -> Result<NodeId> {
+        let name = self.arena.push(&rec.name)?;
+        let node = Node {
+            file_ref: rec.file_ref,
+            parent: rec.parent,
+            name,
+            flags: if rec.is_dir { flags::DIR } else { 0 },
+            size: rec.size,
+            modified: rec.modified,
+            project: 0,
+        };
+        if let Some(&id) = self.by_ref.get(&rec.file_ref) {
+            let old = self.nodes[id.0 as usize].name;
+            self.arena.release(old);
+            self.nodes[id.0 as usize] = node;
+            return Ok(id);
+        }
+        let id = NodeId(u32::try_from(self.nodes.len()).map_err(|_| crate::Error::ArenaOverflow)?);
+        self.nodes.push(node);
+        self.by_ref.insert(rec.file_ref, id);
+        Ok(id)
+    }
+
+    pub fn lookup(&self, r: FileRef) -> Option<NodeId> {
+        self.by_ref.get(&r).copied()
+    }
+
+    pub fn node(&self, id: NodeId) -> &Node {
+        &self.nodes[id.0 as usize]
+    }
+
+    pub fn node_mut(&mut self, id: NodeId) -> &mut Node {
+        &mut self.nodes[id.0 as usize]
+    }
+
+    pub fn name(&self, id: NodeId) -> &str {
+        self.arena.get(self.node(id).name)
+    }
+
+    /// 遍历所有存活节点。
+    pub fn iter(&self) -> impl Iterator<Item = (NodeId, &Node)> {
+        self.nodes.iter().enumerate().filter(|(_, n)| !n.is_deleted()).map(|(i, n)| (NodeId(i as u32), n))
+    }
+
+    /// 按父链重建完整路径，例如 `C:\Users\me\a.txt`。
+    ///
+    /// 父节点缺失（孤儿）时返回 `None`。
+    pub fn full_path(&self, id: NodeId) -> Option<String> {
+        let mut parts: Vec<&str> = Vec::new();
+        let mut cur = self.node(id);
+        let root = self.info.root;
+        let mut depth = 0;
+        while cur.file_ref != root {
+            parts.push(self.arena.get(cur.name));
+            if cur.parent == root {
+                break;
+            }
+            let pid = self.by_ref.get(&cur.parent)?;
+            cur = self.node(*pid);
+            depth += 1;
+            if depth > MAX_DEPTH {
+                return None;
+            }
+        }
+        let mut out = String::with_capacity(self.info.mount.len() + 64);
+        out.push_str(&self.info.mount);
+        if parts.is_empty() {
+            out.push('\\');
+        }
+        for p in parts.iter().rev() {
+            out.push('\\');
+            out.push_str(p);
+        }
+        Some(out)
+    }
+
+    /// 应用一条 USN 增量变更。
+    pub fn apply(&mut self, ev: &ChangeEvent) -> Result<()> {
+        match ev.kind {
+            ChangeKind::Created | ChangeKind::Renamed => {
+                let id = self.insert(&FileRecord {
+                    file_ref: ev.file_ref,
+                    parent: ev.parent,
+                    name: ev.name.clone(),
+                    is_dir: ev.is_dir,
+                    size: None,
+                    modified: Some(ev.timestamp),
+                })?;
+                let _ = id;
+            }
+            ChangeKind::Deleted => {
+                if let Some(id) = self.by_ref.remove(&ev.file_ref) {
+                    let n = &mut self.nodes[id.0 as usize];
+                    n.flags |= flags::DELETED;
+                    let name = n.name;
+                    self.arena.release(name);
+                }
+            }
+            ChangeKind::Modified => {
+                if let Some(id) = self.lookup(ev.file_ref) {
+                    self.node_mut(id).modified = Some(ev.timestamp);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{FsKind, VolumeId};
+
+    fn vol() -> VolumeIndex {
+        VolumeIndex::new(VolumeInfo {
+            id: VolumeId(0),
+            mount: "C:".into(),
+            fs: FsKind::Ntfs,
+            serial: 1,
+            root: FileRef::NTFS_ROOT,
+        })
+    }
+
+    fn rec(r: u64, p: u64, name: &str, dir: bool) -> FileRecord {
+        FileRecord {
+            file_ref: FileRef(r),
+            parent: FileRef(p),
+            name: name.into(),
+            is_dir: dir,
+            size: None,
+            modified: None,
+        }
+    }
+
+    #[test]
+    fn path_reconstruction_any_insert_order() {
+        let mut v = vol();
+        // 子节点先于父节点到达（ENUM_USN_DATA 按 FRN 顺序，不保证父在前）
+        let f = v.insert(&rec(30, 20, "季度报告.xlsx", false)).unwrap();
+        v.insert(&rec(20, 10, "docs", true)).unwrap();
+        v.insert(&rec(10, 5, "proj", true)).unwrap();
+        assert_eq!(v.full_path(f).as_deref(), Some(r"C:\proj\docs\季度报告.xlsx"));
+    }
+
+    #[test]
+    fn orphan_has_no_path() {
+        let mut v = vol();
+        let f = v.insert(&rec(30, 999, "lost.txt", false)).unwrap();
+        assert_eq!(v.full_path(f), None);
+    }
+
+    #[test]
+    fn rename_move_and_delete() {
+        let mut v = vol();
+        v.insert(&rec(10, 5, "a", true)).unwrap();
+        v.insert(&rec(11, 5, "b", true)).unwrap();
+        let f = v.insert(&rec(30, 10, "x.txt", false)).unwrap();
+        v.apply(&ChangeEvent {
+            usn: 100,
+            kind: ChangeKind::Renamed,
+            file_ref: FileRef(30),
+            parent: FileRef(11),
+            name: "y.txt".into(),
+            is_dir: false,
+            timestamp: 1,
+        })
+        .unwrap();
+        assert_eq!(v.full_path(f).as_deref(), Some(r"C:\b\y.txt"));
+        assert!(v.arena().garbage_bytes() >= "x.txt".len());
+
+        v.apply(&ChangeEvent {
+            usn: 101,
+            kind: ChangeKind::Deleted,
+            file_ref: FileRef(30),
+            parent: FileRef(11),
+            name: "y.txt".into(),
+            is_dir: false,
+            timestamp: 2,
+        })
+        .unwrap();
+        assert_eq!(v.lookup(FileRef(30)), None);
+        assert_eq!(v.live_count(), 2);
+        assert_eq!(v.iter().count(), 2);
+    }
+
+    #[test]
+    fn parent_cycle_does_not_hang() {
+        let mut v = vol();
+        let a = v.insert(&rec(10, 11, "a", true)).unwrap();
+        v.insert(&rec(11, 10, "b", true)).unwrap();
+        assert_eq!(v.full_path(a), None);
+    }
+}

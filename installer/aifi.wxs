@@ -1,0 +1,21 @@
+<!-- M7 占位：WiX v5 安装包骨架，尚不可构建。GUID 与版本号需在实现时填写。 -->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package Name="AI File Index" Manufacturer="ai-file-index contributors"
+           Version="0.1.0" UpgradeCode="PUT-GUID-HERE" Scope="perMachine">
+    <MajorUpgrade DowngradeErrorMessage="A newer version is already installed." />
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="AiFileIndex">
+        <Component Id="Service">
+          <File Source="..\target\release\aifi-service.exe" KeyPath="yes" />
+          <ServiceInstall Name="AiFileIndex" DisplayName="AI File Index"
+                          Description="Local read-only file name index for AI assistants"
+                          Type="ownProcess" Start="auto" ErrorControl="normal" Account="LocalSystem" />
+          <ServiceControl Id="SvcCtl" Name="AiFileIndex" Start="install" Stop="both" Remove="uninstall" Wait="yes" />
+        </Component>
+        <Component Id="Mcp">
+          <File Source="..\target\release\aifi-mcp.exe" KeyPath="yes" />
+        </Component>
+      </Directory>
+    </StandardDirectory>
+  </Package>
+</Wix>

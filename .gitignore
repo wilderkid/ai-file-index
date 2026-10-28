@@ -1,0 +1,11 @@
+/target
+**/*.rs.bk
+*.pdb
+*.msi
+*.zip
+/dist
+# 本地索引快照 / 日志，绝不提交
+*.aifi-snapshot
+/logs
+.env
+.env.*

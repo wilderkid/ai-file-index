@@ -1,0 +1,4 @@
+[toolchain]
+# 跟随 stable；MSRV 见 Cargo.toml 的 rust-version。
+channel = "stable"
+components = ["rustfmt", "clippy"]

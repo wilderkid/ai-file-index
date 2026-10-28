@@ -1,0 +1,19 @@
+[package]
+name = "aifi-harness"
+description = "Fake volume + fixtures so index/USN logic can be tested on any OS without touching a real disk."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+aifi-core.workspace = true
+
+[dev-dependencies]
+aifi-query.workspace = true
+aifi-project.workspace = true
+aifi-protocol.workspace = true
+
+[lints]
+workspace = true

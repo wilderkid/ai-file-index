@@ -1,0 +1,13 @@
+[package]
+name = "aifi-pinyin"
+description = "Pinyin / initials keys and mixed Chinese-pinyin matching for file names."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+pinyin.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,15 @@
+ai-file-index is dual-licensed under either of
+
+  * Apache License, Version 2.0 (LICENSE-APACHE or https://www.apache.org/licenses/LICENSE-2.0)
+  * MIT license (LICENSE-MIT or https://opensource.org/licenses/MIT)
+
+at your option.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted
+for inclusion in the work by you, as defined in the Apache-2.0 license, shall be
+dual licensed as above, without any additional terms or conditions.
+
+---
+注：MIT/Apache-2.0 双许可是**提议**（Rust 生态惯例）。仓库所有者在首次公开发布前
+可以改成其他许可证；改动时请同步修改 Cargo.toml 的 `workspace.package.license`
+以及 README 的许可证一节。
