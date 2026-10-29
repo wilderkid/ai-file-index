@@ -122,6 +122,11 @@ impl VolumeIndex {
         &self.arena
     }
 
+    /// 节点表（含墓碑）。只供快照序列化使用。
+    pub fn nodes_raw(&self) -> &[Node] {
+        &self.nodes
+    }
+
     /// 直接子节点（不含已删除的）。顺序是插入顺序，不保证排序。
     pub fn children(&self, id: NodeId) -> impl Iterator<Item = NodeId> + '_ {
         let parent = self.node(id).file_ref;

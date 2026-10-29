@@ -10,12 +10,13 @@
 
 pub mod arena;
 pub mod index;
+pub mod snapshot;
 pub mod source;
 pub mod types;
 
 pub use arena::{NameRef, StringArena};
 pub use index::{MemoryStats, NodeId, VolumeIndex};
-pub use source::{SnapshotStore, VolumeSource, build_index, catch_up};
+pub use source::{SnapshotStore, StartKind, VolumeSource, build_index, catch_up, open_or_rebuild};
 pub use types::*;
 
 /// 本 crate 的统一错误类型。

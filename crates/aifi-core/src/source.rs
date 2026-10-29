@@ -1,8 +1,8 @@
 //! 数据源与快照的抽象接口。
 
-use crate::Result;
 use crate::index::VolumeIndex;
 use crate::types::{ChangeEvent, FileRecord, JournalCursor, VolumeInfo};
+use crate::{Error, Result};
 
 /// 一个卷的数据来源。
 ///
@@ -55,6 +55,36 @@ pub fn build_index<S: VolumeSource + ?Sized>(src: &mut S) -> Result<(VolumeIndex
         return Err(e);
     }
     Ok((idx, cursor))
+}
+
+/// 启动方式，供 `index_status` 报告。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartKind {
+    /// 从快照恢复并追上了停机期间的增量。
+    FromSnapshot,
+    /// 没有可用快照，或快照之后的日志已被截断，做了全量枚举。
+    FullRebuild,
+}
+
+/// 打开一个卷的索引：优先用快照，快照不可用或日志被重置时全量重建。
+///
+/// 任何失败都退化为全量重建，不把错误抛给调用方。
+pub fn open_or_rebuild<S, T>(src: &mut S, store: &T) -> Result<(VolumeIndex, JournalCursor, StartKind)>
+where
+    S: VolumeSource + ?Sized,
+    T: SnapshotStore + ?Sized,
+{
+    let info = src.info()?;
+    if let Some((mut idx, cursor)) = store.load(&info)? {
+        match catch_up(src, &mut idx, cursor) {
+            Ok(cursor) => return Ok((idx, cursor, StartKind::FromSnapshot)),
+            // 日志被截断或重置：丢弃快照，下面走全量。
+            Err(Error::JournalReset(_)) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    let (idx, cursor) = build_index(src)?;
+    Ok((idx, cursor, StartKind::FullRebuild))
 }
 
 /// 把增量变更追到最新。

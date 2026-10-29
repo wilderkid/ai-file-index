@@ -96,6 +96,11 @@ impl StringArena {
         Ok(())
     }
 
+    /// 底层字节。只供快照序列化使用。
+    pub fn as_bytes(&self) -> &[u8] {
+        self.buf.as_bytes()
+    }
+
     pub fn len_bytes(&self) -> usize {
         self.buf.len()
     }
