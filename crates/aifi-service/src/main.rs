@@ -11,6 +11,7 @@
 //! 非 Windows 平台上本二进制只打印提示并退出（便于 `cargo build` 全工作区）。
 
 mod handler;
+mod recent;
 
 /// 服务名（`sc.exe` / 安装器使用）。
 pub const SERVICE_NAME: &str = "AiFileIndex";

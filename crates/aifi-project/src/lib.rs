@@ -14,6 +14,8 @@ pub mod registry;
 pub mod tree;
 
 pub use denylist::{DEFAULT_DENY_DIRS, DEFAULT_DENY_FILE_GLOBS, Denylist};
+pub use registry::ProjectRegistry;
+pub use tree::{TreeEntry, TreeOptions, TreeWalk, walk_tree};
 
 /// 项目根标记（文件或目录名）。`*.sln` 用后缀匹配。
 pub const ROOT_MARKERS: &[&str] = &[

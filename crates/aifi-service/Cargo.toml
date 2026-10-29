@@ -24,5 +24,8 @@ aifi-ntfs.workspace = true
 windows-service.workspace = true
 tokio.workspace = true
 
+[dev-dependencies]
+aifi-harness.workspace = true
+
 [lints]
 workspace = true

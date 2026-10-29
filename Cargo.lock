@@ -103,6 +103,7 @@ name = "aifi-service"
 version = "0.1.0"
 dependencies = [
  "aifi-core",
+ "aifi-harness",
  "aifi-ntfs",
  "aifi-project",
  "aifi-protocol",
