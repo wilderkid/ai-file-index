@@ -76,6 +76,9 @@ pub mod reason {
     }
 }
 
+/// `USN_RECORD_V2/V3` 缓冲区的平台无关解析。
+pub mod parse;
+
 #[cfg(windows)]
 mod win;
 

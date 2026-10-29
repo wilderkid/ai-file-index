@@ -1,53 +1,210 @@
-//! Windows 实现（M2 / M3）。目前全部是带文档的 `todo!()`。
+//! Windows 实现（M2）。只读打开卷、枚举 USN 数据、列出固定 NTFS 卷。
+//!
+//! 安全约束：只用 `GENERIC_READ` 打开卷，只用 `FSCTL_ENUM_USN_DATA` /
+//! `FSCTL_QUERY_USN_JOURNAL` / `FSCTL_GET_NTFS_VOLUME_DATA`。不调用任何创建或删除
+//! USN 日志的 IOCTL。句柄由 [`NtfsVolume`] 持有，`Drop` 时关闭。
 
-use aifi_core::{ChangeEvent, FileRecord, JournalCursor, Result, VolumeId, VolumeInfo, VolumeSource};
-use windows::Win32::Foundation::HANDLE;
+use std::ffi::c_void;
+
+use aifi_core::{ChangeEvent, FileRecord, FileRef, FsKind, JournalCursor, Result, VolumeId, VolumeInfo, VolumeSource};
+use windows::Win32::Foundation::{CloseHandle, ERROR_HANDLE_EOF, GENERIC_READ, HANDLE};
+use windows::Win32::Storage::FileSystem::{
+    CreateFileW, FILE_ATTRIBUTE_DIRECTORY, FILE_SHARE_READ, FILE_SHARE_WRITE, GetDriveTypeW, GetLogicalDriveStringsW,
+    GetVolumeInformationW, OPEN_EXISTING,
+};
+use windows::Win32::System::IO::DeviceIoControl;
+use windows::Win32::System::Ioctl::{
+    FSCTL_ENUM_USN_DATA, FSCTL_QUERY_USN_JOURNAL, MFT_ENUM_DATA_V1, USN_JOURNAL_DATA_V0,
+};
+use windows::Win32::System::WindowsProgramming::DRIVE_FIXED;
+use windows::core::PCWSTR;
+
+use crate::parse::{RawUsnRecord, parse_usn_records};
+
+/// 枚举缓冲区大小。64 KiB 起步，单次 IOCTL 能装下数百条记录。
+const ENUM_BUF: usize = 64 * 1024;
 
 /// 一个已打开的 NTFS 卷（只读）。
 pub struct NtfsVolume {
-    /// `\\.\C:` 的句柄；`Drop` 时关闭。
+    /// `\\.\C:` 的句柄。`Drop` 时关闭，包括 `open` 失败后的部分初始化路径。
     handle: HANDLE,
-    id: VolumeId,
-    mount: String,
+    info: VolumeInfo,
 }
 
 impl NtfsVolume {
     /// 以只读方式打开 `\\.\{mount}`（例如 `C:`）。需要管理员权限。
     ///
-    /// M2：`CreateFileW(GENERIC_READ, FILE_SHARE_READ|FILE_SHARE_WRITE, OPEN_EXISTING)`，
-    /// 并用 `GetVolumeInformationW` 确认文件系统为 NTFS、取卷序列号。
-    pub fn open(_id: VolumeId, _mount: &str) -> Result<Self> {
-        todo!("M2: open volume handle read-only")
+    /// 打开后用 `GetVolumeInformationW` 确认文件系统为 NTFS 并取卷序列号。
+    /// 不是 NTFS 时返回错误并关闭句柄。
+    pub fn open(id: VolumeId, mount: &str) -> Result<Self> {
+        let device = format!(r"\\.\{}", mount.trim_end_matches(['\\', ':']));
+        let wide: Vec<u16> = device.encode_utf16().chain(std::iter::once(0)).collect();
+        // SAFETY: `wide` 是以 NUL 结尾的 UTF-16，生命周期覆盖整个调用。
+        // 只请求 GENERIC_READ，共享读写以便不干扰其他进程。
+        let handle = unsafe {
+            CreateFileW(
+                PCWSTR(wide.as_ptr()),
+                GENERIC_READ.0,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                None,
+                OPEN_EXISTING,
+                windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES(0),
+                None,
+            )
+        }
+        .map_err(|e| aifi_core::Error::Platform(e.to_string()))?;
+
+        let mut volume = Self {
+            handle,
+            info: VolumeInfo { id, mount: mount.to_string(), fs: FsKind::Ntfs, serial: 0, root: FileRef::NTFS_ROOT },
+        };
+        match volume_serial(&format!(r"{mount}\")) {
+            Ok(serial) => {
+                volume.info.serial = serial;
+                Ok(volume)
+            }
+            Err(e) => {
+                // `volume` 离开作用域时 Drop 关闭句柄。
+                drop(volume);
+                Err(e)
+            }
+        }
     }
 }
 
 impl Drop for NtfsVolume {
     fn drop(&mut self) {
-        // M2：CloseHandle(self.handle)
-        let _ = (&self.handle, &self.id, &self.mount);
+        // SAFETY: `handle` 来自 `CreateFileW` 且只关闭一次；`Drop` 是唯一的关闭点。
+        unsafe {
+            let _ = CloseHandle(self.handle);
+        }
     }
+}
+
+/// 取卷序列号，并确认文件系统名是 NTFS。
+fn volume_serial(root: &str) -> Result<u64> {
+    let wide: Vec<u16> = root.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut serial = 0u32;
+    let mut fs_name = [0u16; 16];
+    // SAFETY: 两个缓冲区都是有效的可写切片，长度与传入的 size 参数一致。
+    unsafe {
+        GetVolumeInformationW(PCWSTR(wide.as_ptr()), None, Some(&mut serial), None, None, Some(&mut fs_name))
+            .map_err(|e| aifi_core::Error::Platform(e.to_string()))?;
+    }
+    let fs = String::from_utf16_lossy(&fs_name[..fs_name.iter().position(|&c| c == 0).unwrap_or(fs_name.len())]);
+    if !fs.eq_ignore_ascii_case("NTFS") {
+        return Err(aifi_core::Error::Platform(format!("{root} is {fs}, not NTFS")));
+    }
+    Ok(serial as u64)
 }
 
 impl VolumeSource for NtfsVolume {
     fn info(&self) -> Result<VolumeInfo> {
-        todo!("M2: volume info (serial, fs kind, root FRN)")
+        Ok(self.info.clone())
     }
 
-    /// M2：先 `FSCTL_QUERY_USN_JOURNAL` 取 `UsnJournalID` / `NextUsn`（日志不存在时返回明确错误，
-    /// **不要**自动创建），再循环 `FSCTL_ENUM_USN_DATA`（`MFT_ENUM_DATA_V0`，64 KiB 以上缓冲），
-    /// 解析 `USN_RECORD_V2/V3`（V3 的 128 位 FRN 截成 64 位并记录告警），UTF-16 名转 UTF-8。
-    fn enumerate(&mut self, _sink: &mut dyn FnMut(FileRecord)) -> Result<JournalCursor> {
-        todo!("M2: FSCTL_ENUM_USN_DATA enumeration")
+    fn enumerate(&mut self, sink: &mut dyn FnMut(FileRecord)) -> Result<JournalCursor> {
+        let journal = query_journal(self.handle)?;
+        let mut start = 0u64;
+        let mut buf = vec![0u8; ENUM_BUF];
+        loop {
+            let input = MFT_ENUM_DATA_V1 {
+                StartFileReferenceNumber: start,
+                LowUsn: 0,
+                HighUsn: journal.NextUsn,
+                MinMajorVersion: 2,
+                MaxMajorVersion: 3,
+            };
+            let mut returned = 0u32;
+            // SAFETY: `input` 是合法的 MFT_ENUM_DATA_V1，`buf` 是可写缓冲区，长度与传入一致。
+            // 该 IOCTL 只读，不修改卷。
+            let res = unsafe {
+                DeviceIoControl(
+                    self.handle,
+                    FSCTL_ENUM_USN_DATA,
+                    Some((&input as *const MFT_ENUM_DATA_V1).cast::<c_void>()),
+                    std::mem::size_of::<MFT_ENUM_DATA_V1>() as u32,
+                    Some(buf.as_mut_ptr().cast::<c_void>()),
+                    buf.len() as u32,
+                    Some(&mut returned),
+                    None,
+                )
+            };
+            if let Err(e) = res {
+                if e.code() == ERROR_HANDLE_EOF.to_hresult() {
+                    break;
+                }
+                return Err(aifi_core::Error::Platform(e.to_string()));
+            }
+            if returned < 8 {
+                break;
+            }
+            start = u64::from_le_bytes(buf[..8].try_into().unwrap());
+            for rec in parse_usn_records(&buf[8..returned as usize]) {
+                let rec = rec.map_err(|e| aifi_core::Error::Platform(e.to_string()))?;
+                sink(to_file_record(&rec));
+            }
+        }
+        Ok(JournalCursor { journal_id: journal.UsnJournalID, next_usn: journal.NextUsn })
     }
 
-    /// M3：`FSCTL_READ_USN_JOURNAL`（`READ_USN_JOURNAL_DATA_V0`，`ReasonMask` 覆盖创建/删除/重命名/数据变化），
-    /// 用 [`crate::reason::classify`] 归一；`ERROR_JOURNAL_ENTRY_DELETED` / Journal ID 变化 → `Error::JournalReset`。
     fn read_changes(&mut self, _from: JournalCursor, _sink: &mut dyn FnMut(ChangeEvent)) -> Result<JournalCursor> {
         todo!("M3: FSCTL_READ_USN_JOURNAL")
     }
 }
 
-/// 列出本机所有固定 NTFS 卷（`GetLogicalDriveStringsW` + `GetDriveTypeW == DRIVE_FIXED`）。
+fn to_file_record(r: &RawUsnRecord) -> FileRecord {
+    FileRecord {
+        file_ref: FileRef(r.frn),
+        parent: FileRef(r.parent),
+        name: r.name.clone(),
+        is_dir: r.attributes & FILE_ATTRIBUTE_DIRECTORY.0 != 0,
+        size: None,
+        modified: None,
+    }
+}
+
+/// 查询 USN 日志的当前位置。日志不存在时返回错误，**不**创建日志。
+fn query_journal(handle: HANDLE) -> Result<USN_JOURNAL_DATA_V0> {
+    let mut out = USN_JOURNAL_DATA_V0::default();
+    let mut returned = 0u32;
+    // SAFETY: `out` 是可写的 USN_JOURNAL_DATA_V0，该 IOCTL 只读。
+    unsafe {
+        DeviceIoControl(
+            handle,
+            FSCTL_QUERY_USN_JOURNAL,
+            None,
+            0,
+            Some((&mut out as *mut USN_JOURNAL_DATA_V0).cast::<c_void>()),
+            std::mem::size_of::<USN_JOURNAL_DATA_V0>() as u32,
+            Some(&mut returned),
+            None,
+        )
+    }
+    .map_err(|e| aifi_core::Error::Platform(format!("usn journal not active: {e}")))?;
+    Ok(out)
+}
+
+/// 列出本机所有固定 NTFS 卷的盘符（如 `C:`）。
 pub fn list_ntfs_volumes() -> Result<Vec<String>> {
-    todo!("M2: enumerate fixed NTFS volumes")
+    let mut drives = [0u16; 512];
+    // SAFETY: `drives` 是 512 个 u16 的可写缓冲区，长度与传入一致。
+    let n = unsafe { GetLogicalDriveStringsW(Some(&mut drives)) } as usize;
+    if n == 0 || n > drives.len() {
+        return Err(aifi_core::Error::Platform("GetLogicalDriveStringsW failed".into()));
+    }
+    let mut out = Vec::new();
+    for drive in drives[..n].split(|&c| c == 0).filter(|s| !s.is_empty()) {
+        let wide: Vec<u16> = drive.iter().copied().chain(std::iter::once(0)).collect();
+        // SAFETY: `wide` 以 NUL 结尾。
+        let kind = unsafe { GetDriveTypeW(PCWSTR(wide.as_ptr())) };
+        if kind != DRIVE_FIXED {
+            continue;
+        }
+        let letter = String::from_utf16_lossy(drive).trim_end_matches('\\').to_string();
+        if volume_serial(&format!(r"{letter}\")).is_ok() {
+            out.push(letter);
+        }
+    }
+    Ok(out)
 }
