@@ -40,7 +40,7 @@ pub fn tool_definitions() -> Vec<ToolDef> {
         },
         ToolDef {
             name: LIST_PROJECT_TREE,
-            description: "Return the directory tree of a project (respects .gitignore and default excludes like node_modules/target).",
+            description: "List the children of any indexed directory, not only code projects. Respects .gitignore inside a project and default excludes like node_modules/target. Pass `path` (or `cwd`) and `max_depth` (1 = direct children).",
             input_schema: schema_of::<ListProjectTreeParams>(),
         },
         ToolDef {

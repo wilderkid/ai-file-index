@@ -114,14 +114,12 @@ impl<'a> Handler<'a> {
         let Some(start) = start else {
             return Response::Error { code: ErrorCode::InvalidParams, message: "path or cwd required".into() };
         };
-        let Some(proj) = self.projects.resolve(start) else {
-            return Response::Error { code: ErrorCode::InvalidParams, message: "no project at that path".into() };
-        };
-        if self.denylist.is_denied(&proj.root) {
+        if self.denylist.is_denied(start) {
             return Response::Error { code: ErrorCode::Denied, message: "path denied".into() };
         }
-        let Some((idx, root_id)) = self.locate(&proj.root) else {
-            return Response::Error { code: ErrorCode::NotReady, message: "project root not in index".into() };
+        // 任意已索引目录都能列，不必是项目根。项目根只用来决定要不要套 gitignore。
+        let Some((idx, root_id)) = self.locate(start) else {
+            return Response::Error { code: ErrorCode::InvalidParams, message: "path not in index".into() };
         };
         let opts = TreeOptions {
             max_depth: p.max_depth.unwrap_or(3) as usize,
@@ -130,7 +128,7 @@ impl<'a> Handler<'a> {
         };
         let walk = walk_tree(idx, root_id, &opts, self.denylist, None);
         Response::ProjectTree(aifi_protocol::ProjectTreeResult {
-            root: proj.root.clone(),
+            root: idx.full_path(root_id).unwrap_or_else(|| start.to_string()),
             entries: walk
                 .entries
                 .into_iter()
@@ -193,16 +191,9 @@ impl<'a> Handler<'a> {
         })
     }
 
-    /// 在所有卷里按完整路径找一个节点。
+    /// 在所有卷里按完整路径找一个节点。走路径索引，不扫全表。
     fn locate(&self, path: &str) -> Option<(&'a VolumeIndex, aifi_core::NodeId)> {
-        for idx in self.volumes {
-            for (id, _) in idx.iter() {
-                if idx.full_path(id).is_some_and(|p| p.eq_ignore_ascii_case(path)) {
-                    return Some((idx, id));
-                }
-            }
-        }
-        None
+        self.volumes.iter().find_map(|idx| idx.lookup_path(path).map(|id| (idx, id)))
     }
 }
 
@@ -288,6 +279,30 @@ mod tests {
                 assert_eq!(t.root, r"C:\src\aifi");
                 assert!(t.entries.iter().any(|e| e.rel_path.ends_with("main.rs")));
             }
+            r => panic!("{r:?}"),
+        }
+    }
+
+    #[test]
+    fn tree_lists_a_directory_that_is_not_a_project() {
+        let (idx, projects, deny) = setup();
+        let h = Handler::new(std::slice::from_ref(&idx), &projects, &deny);
+        match h.handle(Request::ListProjectTree(aifi_protocol::ListProjectTreeParams {
+            path: Some(r"C:\Users\me\Documents".into()),
+            max_depth: Some(1),
+            ..Default::default()
+        })) {
+            Response::ProjectTree(t) => {
+                assert!(t.root.eq_ignore_ascii_case(r"C:\Users\me\Documents"));
+                assert!(t.entries.iter().any(|e| e.rel_path.contains("季度报告")));
+            }
+            r => panic!("{r:?}"),
+        }
+        match h.handle(Request::ListProjectTree(aifi_protocol::ListProjectTreeParams {
+            path: Some(r"C:\no\such".into()),
+            ..Default::default()
+        })) {
+            Response::Error { code, .. } => assert_eq!(code, ErrorCode::InvalidParams),
             r => panic!("{r:?}"),
         }
     }

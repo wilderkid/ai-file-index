@@ -140,6 +140,33 @@ impl VolumeIndex {
         }
     }
 
+    /// 按完整路径查找存活节点。从卷根沿子节点表逐级走，不存全路径副本。
+    ///
+    /// 大小写不敏感。`C:\foo` 与 `C:/foo/` 等价。卷根本身不在枚举结果里，查 `C:` 返回 `None`。
+    pub fn lookup_path(&self, path: &str) -> Option<NodeId> {
+        let mount = self.info.mount.trim_end_matches(['\\', '/']);
+        let trimmed = path.trim_end_matches(['\\', '/']);
+        if trimmed.len() < mount.len() || !trimmed[..mount.len()].eq_ignore_ascii_case(mount) {
+            return None;
+        }
+        let rest = trimmed[mount.len()..].trim_start_matches(['\\', '/']);
+        let root_low = self.info.root.0 & 0x0000_FFFF_FFFF_FFFF;
+        let root_ref = self
+            .nodes
+            .iter()
+            .find(|n| !n.is_deleted() && n.parent.0 & 0x0000_FFFF_FFFF_FFFF == root_low)
+            .map(|n| n.parent)?;
+        let mut kids = self.children.get(&root_ref).map(Vec::as_slice).unwrap_or(&[]);
+        let mut current = None;
+        for part in rest.split(['\\', '/']).filter(|s| !s.is_empty()) {
+            let id = kids.iter().copied().find(|&id| self.name(id).eq_ignore_ascii_case(part))?;
+            current = Some(id);
+            let frn = self.node(id).file_ref;
+            kids = self.children.get(&frn).map(Vec::as_slice).unwrap_or(&[]);
+        }
+        current
+    }
+
     /// 节点表（含墓碑）。只供快照序列化使用。
     pub fn nodes_raw(&self) -> &[Node] {
         &self.nodes
