@@ -56,6 +56,38 @@ fn enumerate_c_matches_root_and_reports_timing() {
 
 #[test]
 #[ignore]
+fn read_changes_sees_a_created_file_within_a_second() {
+    let mut vol = open_c();
+    let cursor = vol.enumerate(&mut |_| {}).expect("enumerate");
+
+    let dir = std::env::temp_dir().join(format!("aifi-usn-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("probe.txt");
+    std::fs::write(&file, b"probe").unwrap();
+
+    let start = std::time::Instant::now();
+    let mut seen = false;
+    while start.elapsed() < std::time::Duration::from_secs(2) {
+        let mut found = false;
+        vol.read_changes(cursor, &mut |ev| {
+            if ev.name == "probe.txt" {
+                found = true;
+            }
+        })
+        .expect("read_changes");
+        if found {
+            seen = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(seen, "创建的文件应在 1 秒内出现在 USN 增量里");
+    eprintln!("probe.txt visible after {:.0} ms", start.elapsed().as_secs_f64() * 1000.0);
+}
+
+#[test]
+#[ignore]
 fn list_volumes_includes_c() {
     let vols = aifi_ntfs::list_ntfs_volumes().expect("list volumes");
     eprintln!("NTFS volumes: {vols:?}");

@@ -6,9 +6,9 @@
 
 use std::io::{Error, ErrorKind, Result};
 
-use aifi_core::{ChangeEvent, FileRef};
 #[cfg(test)]
 use aifi_core::ChangeKind;
+use aifi_core::{ChangeEvent, FileRef};
 
 /// 一条解析后的 USN 记录。
 #[derive(Debug, Clone, PartialEq, Eq)]

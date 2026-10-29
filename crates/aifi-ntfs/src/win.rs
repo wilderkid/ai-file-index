@@ -7,14 +7,15 @@
 use std::ffi::c_void;
 
 use aifi_core::{ChangeEvent, FileRecord, FileRef, FsKind, JournalCursor, Result, VolumeId, VolumeInfo, VolumeSource};
-use windows::Win32::Foundation::{CloseHandle, ERROR_HANDLE_EOF, GENERIC_READ, HANDLE};
+use windows::Win32::Foundation::{CloseHandle, ERROR_HANDLE_EOF, ERROR_JOURNAL_ENTRY_DELETED, GENERIC_READ, HANDLE};
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_ATTRIBUTE_DIRECTORY, FILE_SHARE_READ, FILE_SHARE_WRITE, GetDriveTypeW, GetLogicalDriveStringsW,
     GetVolumeInformationW, OPEN_EXISTING,
 };
 use windows::Win32::System::IO::DeviceIoControl;
 use windows::Win32::System::Ioctl::{
-    FSCTL_ENUM_USN_DATA, FSCTL_QUERY_USN_JOURNAL, MFT_ENUM_DATA_V1, USN_JOURNAL_DATA_V0,
+    FSCTL_ENUM_USN_DATA, FSCTL_QUERY_USN_JOURNAL, FSCTL_READ_USN_JOURNAL, MFT_ENUM_DATA_V1, READ_USN_JOURNAL_DATA_V1,
+    USN_JOURNAL_DATA_V0,
 };
 use windows::Win32::System::WindowsProgramming::DRIVE_FIXED;
 use windows::core::PCWSTR;
@@ -151,8 +152,59 @@ impl VolumeSource for NtfsVolume {
         Ok(JournalCursor { journal_id: journal.UsnJournalID, next_usn: journal.NextUsn })
     }
 
-    fn read_changes(&mut self, _from: JournalCursor, _sink: &mut dyn FnMut(ChangeEvent)) -> Result<JournalCursor> {
-        todo!("M3: FSCTL_READ_USN_JOURNAL")
+    fn read_changes(&mut self, from: JournalCursor, sink: &mut dyn FnMut(ChangeEvent)) -> Result<JournalCursor> {
+        let journal = query_journal(self.handle)?;
+        // 日志被删除重建过：Journal ID 变了，游标作废。
+        if journal.UsnJournalID != from.journal_id {
+            return Err(aifi_core::Error::JournalReset(self.info.id));
+        }
+        let input = READ_USN_JOURNAL_DATA_V1 {
+            StartUsn: from.next_usn,
+            // 全部原因位。常量取自 winioctl.h 的 USN_REASON_MASK，不依赖 windows crate 的导出名。
+            ReasonMask: 0xFFFF_FFFF,
+            // 只在关闭时返回，一条记录带合并后的原因位，避免同一操作的多条中间记录。
+            ReturnOnlyOnClose: 1,
+            Timeout: 0,
+            // 0 = 不阻塞，有多少读多少。服务层的等待循环由调用方负责。
+            BytesToWaitFor: 0,
+            UsnJournalID: from.journal_id,
+            MinMajorVersion: 2,
+            MaxMajorVersion: 3,
+        };
+        let mut buf = vec![0u8; ENUM_BUF];
+        let mut returned = 0u32;
+        // SAFETY: `input` 是合法的 READ_USN_JOURNAL_DATA_V1，`buf` 可写且长度与传入一致。
+        // 该 IOCTL 只读，不修改卷，也不创建或删除日志。
+        let res = unsafe {
+            DeviceIoControl(
+                self.handle,
+                FSCTL_READ_USN_JOURNAL,
+                Some((&input as *const READ_USN_JOURNAL_DATA_V1).cast::<c_void>()),
+                std::mem::size_of::<READ_USN_JOURNAL_DATA_V1>() as u32,
+                Some(buf.as_mut_ptr().cast::<c_void>()),
+                buf.len() as u32,
+                Some(&mut returned),
+                None,
+            )
+        };
+        if let Err(e) = res {
+            // 游标落后于日志截断点：必须整卷重建。
+            if e.code() == ERROR_JOURNAL_ENTRY_DELETED.to_hresult() {
+                return Err(aifi_core::Error::JournalReset(self.info.id));
+            }
+            return Err(aifi_core::Error::Platform(e.to_string()));
+        }
+        if returned < 8 {
+            return Ok(from);
+        }
+        let next = i64::from_le_bytes(buf[..8].try_into().unwrap());
+        for rec in parse_usn_records(&buf[8..returned as usize]) {
+            let rec = rec.map_err(|e| aifi_core::Error::Platform(e.to_string()))?;
+            if let Some(ev) = crate::parse::to_change_event(&rec) {
+                sink(ev);
+            }
+        }
+        Ok(JournalCursor { journal_id: from.journal_id, next_usn: next })
     }
 }
 
