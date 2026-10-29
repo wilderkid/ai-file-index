@@ -508,6 +508,42 @@ mod tests {
     }
 
     #[test]
+    fn same_name_ranks_by_project_tier() {
+        let idx = index();
+        let deny = Denylist::with_defaults();
+        let tier = |p: &str| {
+            if aifi_project::is_within(p, r"C:\src\demo") {
+                RankTier::CurrentProject
+            } else if p.contains(r"\Docs\") {
+                RankTier::UserDir
+            } else {
+                RankTier::Other
+            }
+        };
+        let ctx = QueryContext { denylist: &deny, tier: &tier, max_tier: RankTier::Other, gitignored: None };
+        let q = CompiledQuery::compile(QuerySpec { text: "main.rs".into(), ..Default::default() }).unwrap();
+        let (hits, _) = search_volume(&idx, &q, &ctx, 10);
+        let tiers: Vec<_> = hits.iter().map(|h| h.tier).collect();
+        let mut sorted = tiers.clone();
+        sorted.sort();
+        assert_eq!(tiers, sorted, "当前项目应排在用户目录之前");
+        assert_eq!(hits[0].tier, RankTier::CurrentProject);
+    }
+
+    #[test]
+    fn gitignore_filter_drops_matches_but_not_denylisted() {
+        let idx = index();
+        let deny = Denylist::with_defaults();
+        let tier = |_: &str| RankTier::Other;
+        let gi = |path: &str, _: bool| path.ends_with("main_window.rs");
+        let ctx = QueryContext { denylist: &deny, tier: &tier, max_tier: RankTier::Other, gitignored: Some(&gi) };
+        let q = CompiledQuery::compile(QuerySpec { text: "main".into(), ..Default::default() }).unwrap();
+        let (hits, _) = search_volume(&idx, &q, &ctx, 10);
+        assert!(hits.iter().all(|h| !h.path.ends_with("main_window.rs")));
+        assert!(!hits.is_empty());
+    }
+
+    #[test]
     fn pinyin_initials_hit() {
         let (hits, _) = run(QuerySpec { text: "jdbg".into(), pinyin: true, ..Default::default() }, RankTier::Other);
         assert_eq!(hits.len(), 1);

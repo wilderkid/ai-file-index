@@ -63,6 +63,16 @@ impl Denylist {
         Self::new(DEFAULT_DENY_DIRS, DEFAULT_DENY_FILE_GLOBS).expect("default denylist globs are valid")
     }
 
+    /// 在默认规则之上追加。内置项始终保留：传入的规则里即使缺少某个默认项，
+    /// 结果里也仍然包含它。这是"只能追加、不能删除"的保证。
+    pub fn with_extra(dirs: &[&str], file_globs: &[&str]) -> Result<Self, globset::Error> {
+        let mut all_dirs: Vec<&str> = DEFAULT_DENY_DIRS.to_vec();
+        all_dirs.extend_from_slice(dirs);
+        let mut all_globs: Vec<&str> = DEFAULT_DENY_FILE_GLOBS.to_vec();
+        all_globs.extend_from_slice(file_globs);
+        Self::new(&all_dirs, &all_globs)
+    }
+
     /// 自定义规则（用户配置可在默认之上**追加**，不建议删除默认项）。
     pub fn new(dirs: &[&str], file_globs: &[&str]) -> Result<Self, globset::Error> {
         let dirs = dirs.iter().map(|d| crate::components(d).map(|c| c.to_ascii_lowercase()).collect()).collect();
@@ -110,6 +120,17 @@ mod tests {
         ] {
             assert!(d.is_denied(p), "{p} should be denied");
         }
+    }
+
+    #[test]
+    fn extra_rules_can_only_add() {
+        // 试图只保留一个自定义目录，不带任何内置项。
+        let extended = Denylist::with_extra(&[r"secret-dir"], &["*.secret"]).unwrap();
+        assert!(extended.is_denied(r"C:\x\secret-dir\a.txt"));
+        assert!(extended.is_denied(r"C:\x\vault.secret"));
+        // 内置项仍然生效。
+        assert!(extended.is_denied(r"C:\Users\me\.ssh\id_rsa"));
+        assert!(extended.is_denied(r"C:\src\app\.env"));
     }
 
     #[test]

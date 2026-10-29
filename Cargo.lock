@@ -65,6 +65,7 @@ dependencies = [
 name = "aifi-project"
 version = "0.1.0"
 dependencies = [
+ "aifi-core",
  "globset",
  "ignore",
  "thiserror",

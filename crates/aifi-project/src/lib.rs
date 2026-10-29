@@ -10,6 +10,8 @@
 //! 路径一律按 Windows 语义处理：分隔符 `\` 或 `/`，**大小写不敏感**。
 
 pub mod denylist;
+pub mod registry;
+pub mod tree;
 
 pub use denylist::{DEFAULT_DENY_DIRS, DEFAULT_DENY_FILE_GLOBS, Denylist};
 
@@ -126,21 +128,37 @@ pub fn rank_tier(path: &str, current: Option<&str>, projects: &[&str], user_home
 
 /// 项目级 `.gitignore` 过滤器（基于 `ignore::gitignore`）。
 pub struct GitignoreFilter {
-    _root: String,
+    gi: ignore::gitignore::Gitignore,
 }
 
 impl GitignoreFilter {
-    /// 从项目根下的 `.gitignore`（以及嵌套的 `.gitignore`）构建。
+    /// 从调用方提供的 `.gitignore` 内容构建，不读盘。
     ///
-    /// M5：用 `ignore::gitignore::GitignoreBuilder`；文件内容通过服务读取，
-    /// 并在 USN 报告 `.gitignore` 变化时失效重建。
-    pub fn from_project(_root: &str) -> Result<Self, ignore::Error> {
-        todo!("M5: build from .gitignore files under the project root")
+    /// `files` 的每一项是（相对项目根的目录, 该目录下 `.gitignore` 的内容）。
+    /// 空字符串表示项目根。服务负责读取文件内容，并在 `.gitignore` 变化时重建。
+    ///
+    /// Windows 上匹配大小写不敏感。
+    pub fn from_contents(root: &str, files: &[(String, String)]) -> Result<Self, ignore::Error> {
+        let mut b = ignore::gitignore::GitignoreBuilder::new(root);
+        b.case_insensitive(true)?;
+        for (dir, content) in files {
+            let from = std::path::Path::new(root).join(dir).join(".gitignore");
+            for line in content.lines() {
+                b.add_line(Some(from.clone()), line)?;
+            }
+        }
+        Ok(Self { gi: b.build()? })
     }
 
     /// 相对项目根的路径是否被忽略。
-    pub fn is_ignored(&self, _rel_path: &str, _is_dir: bool) -> bool {
-        todo!("M5: matched_path_or_any_parents")
+    ///
+    /// 同时检查路径本身及其每一级父目录：父目录被忽略时，其下的内容也算被忽略。
+    pub fn is_ignored(&self, rel_path: &str, is_dir: bool) -> bool {
+        if self.gi.is_empty() {
+            return false;
+        }
+        let path = std::path::Path::new(rel_path);
+        self.gi.matched_path_or_any_parents(path, is_dir).is_ignore()
     }
 }
 
@@ -186,6 +204,23 @@ mod tests {
         assert!(is_default_excluded(r"C:\p\node_modules\x\index.js"));
         assert!(is_default_excluded(r"C:\p\Target\debug\a.exe"));
         assert!(!is_default_excluded(r"C:\p\src\targets.rs"));
+    }
+
+    #[test]
+    fn gitignore_handles_negation_anchoring_and_nested_files() {
+        let gi = GitignoreFilter::from_contents(
+            r"C:\src\app",
+            &[("".into(), "target/\n*.log\n!keep.log\n/build\n".into()), (r"src".into(), "generated/\n".into())],
+        )
+        .unwrap();
+
+        assert!(gi.is_ignored(r"target\debug\app.exe", false));
+        assert!(gi.is_ignored("error.log", false));
+        assert!(!gi.is_ignored("keep.log", false), "否定规则应放行");
+        assert!(gi.is_ignored(r"build\out.js", false), "以 / 开头的规则锚定在根");
+        assert!(!gi.is_ignored(r"src\build\out.js", false), "锚定规则不应命中子目录");
+        assert!(gi.is_ignored(r"src\generated\x.rs", false), "嵌套 .gitignore 生效");
+        assert!(!gi.is_ignored(r"src\main.rs", false));
     }
 
     #[test]
