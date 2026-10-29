@@ -21,8 +21,9 @@ use windows::core::PCWSTR;
 
 use crate::parse::{RawUsnRecord, parse_usn_records};
 
-/// 枚举缓冲区大小。64 KiB 起步，单次 IOCTL 能装下数百条记录。
-const ENUM_BUF: usize = 64 * 1024;
+/// 枚举缓冲区大小。64 KiB 时 80 万条目要约 5.5 秒（release），主要耗在 IOCTL 往返次数上；
+/// 1 MiB 把往返次数降一个数量级。
+const ENUM_BUF: usize = 1024 * 1024;
 
 /// 一个已打开的 NTFS 卷（只读）。
 pub struct NtfsVolume {
@@ -37,7 +38,9 @@ impl NtfsVolume {
     /// 打开后用 `GetVolumeInformationW` 确认文件系统为 NTFS 并取卷序列号。
     /// 不是 NTFS 时返回错误并关闭句柄。
     pub fn open(id: VolumeId, mount: &str) -> Result<Self> {
-        let device = format!(r"\\.\{}", mount.trim_end_matches(['\\', ':']));
+        // `C:` 与 `C:\` 都要变成 `\\.\C:`，盘符后的冒号必须保留。
+        let letter = mount.trim_end_matches(['\\', '/']).trim_end_matches(':');
+        let device = format!(r"\\.\{letter}:");
         let wide: Vec<u16> = device.encode_utf16().chain(std::iter::once(0)).collect();
         // SAFETY: `wide` 是以 NUL 结尾的 UTF-16，生命周期覆盖整个调用。
         // 只请求 GENERIC_READ，共享读写以便不干扰其他进程。
