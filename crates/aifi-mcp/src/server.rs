@@ -34,14 +34,35 @@ impl ServerHandler for AifiMcp {
         Ok(ListToolsResult::with_all_items(Self::tools()))
     }
 
-    /// M7：反序列化参数 → `aifi_protocol::Request` → 经命名管道发给服务 → 把结果序列化成
-    /// `CallToolResult`（结构化 JSON + 简短文本摘要）。服务不可达时返回
-    /// `CallToolResult::error("aifi-service not running ...")`，而不是协议错误。
+    /// 反序列化参数 → `aifi_protocol::Request` → 经命名管道发给服务 → 结构化 JSON 加紧凑文本。
+    ///
+    /// 服务未运行时返回工具级错误（`is_error`），而不是协议错误，这样 AI 能看到
+    /// "请启动 AiFileIndex 服务"而不是一次调用失败。
     async fn call_tool(
         &self,
-        _request: CallToolRequestParams,
+        request: CallToolRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
-        todo!("M7: forward tool call over IPC")
+        let args = request.arguments.unwrap_or_default();
+        let req = crate::convert::request_from_tool(&request.name, serde_json::Value::Object(args))?;
+        let resp = match crate::ipc_client::IpcClient::connect().await {
+            Ok(mut client) => client.call(req).await,
+            Err(e) => Err(e),
+        };
+        match resp {
+            Ok(resp) => {
+                let text = crate::convert::render_text(&resp);
+                let structured = serde_json::to_value(&resp).unwrap_or(serde_json::Value::Null);
+                let mut result = rmcp::model::CallToolResult::success(vec![rmcp::model::ContentBlock::text(text)]);
+                result.structured_content = Some(structured);
+                Ok(CallToolResponse::from(result))
+            }
+            Err(_) => {
+                let result = rmcp::model::CallToolResult::error(vec![rmcp::model::ContentBlock::text(
+                    "aifi-service 未运行。请启动 AiFileIndex 服务后重试。",
+                )]);
+                Ok(CallToolResponse::from(result))
+            }
+        }
     }
 }

@@ -9,11 +9,7 @@
 //!
 //! 日志只写 stderr（stdout 是 MCP 协议通道）。
 
-#[allow(dead_code)] // M7 接入 server::call_tool 后移除
-mod ipc_client;
-mod server;
-mod tools;
-
+use aifi_mcp::server;
 use rmcp::ServiceExt;
 
 #[tokio::main(flavor = "current_thread")]
@@ -21,7 +17,7 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt().with_writer(std::io::stderr).with_ansi(false).init();
     if std::env::args().any(|a| a == "--print-tools") {
         // 调试用：打印工具 schema 后退出
-        for t in tools::tool_definitions() {
+        for t in aifi_mcp::tools::tool_definitions() {
             println!(
                 "{}",
                 serde_json::json!({"name": t.name, "description": t.description, "inputSchema": t.input_schema})

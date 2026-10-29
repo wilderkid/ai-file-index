@@ -11,8 +11,11 @@ pub struct IpcClient {
 impl IpcClient {
     /// 连接 [`aifi_protocol::PIPE_NAME`] 并完成 `Hello` 握手；
     /// 协议版本不一致时返回清晰错误（提示升级服务或客户端）。
+    ///
+    /// 管道服务器（M6）尚未实现，因此这里直接返回"服务未运行"，
+    /// 让 MCP 层能给出明确的错误而不是挂起。
     pub async fn connect() -> anyhow::Result<Self> {
-        todo!("M7: open named pipe + hello handshake")
+        anyhow::bail!("aifi-service 未运行：命名管道 {} 不可用", aifi_protocol::PIPE_NAME)
     }
 
     /// 发送一条请求并等待对应 id 的响应（带超时）。
