@@ -6,6 +6,10 @@
 
 use std::io::{Error, ErrorKind, Result};
 
+use aifi_core::{ChangeEvent, FileRef};
+#[cfg(test)]
+use aifi_core::ChangeKind;
+
 /// 一条解析后的 USN 记录。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RawUsnRecord {
@@ -24,6 +28,23 @@ pub struct RawUsnRecord {
 const V2_FIXED: usize = 60;
 /// V3 的 FRN 是 128 位，固定部分比 V2 多 16 字节。
 const V3_FIXED: usize = 76;
+
+/// 把一条 USN 记录转换成索引增量。
+///
+/// 只保留 `reason::classify` 认得出的变更；只有 `RENAME_OLD_NAME` 或纯 `CLOSE`
+/// 的记录返回 `None`。目录与否由 `FILE_ATTRIBUTE_DIRECTORY` 决定。
+pub fn to_change_event(r: &RawUsnRecord) -> Option<ChangeEvent> {
+    let kind = crate::reason::classify(r.reason)?;
+    Some(ChangeEvent {
+        usn: r.usn,
+        kind,
+        file_ref: FileRef(r.frn),
+        parent: FileRef(r.parent),
+        name: r.name.clone(),
+        is_dir: r.attributes & 0x10 != 0,
+        timestamp: r.usn,
+    })
+}
 
 /// 解析 `FSCTL_ENUM_USN_DATA` 输出缓冲区中、起始 FRN 之后的记录区。
 ///
@@ -146,6 +167,29 @@ mod tests {
             b[V3_FIXED + i * 2..V3_FIXED + i * 2 + 2].copy_from_slice(&u.to_le_bytes());
         }
         b
+    }
+
+    #[test]
+    fn to_change_event_maps_reasons() {
+        let mut rec = RawUsnRecord {
+            frn: 30,
+            parent: 10,
+            usn: 500,
+            reason: crate::reason::FILE_CREATE | crate::reason::CLOSE,
+            attributes: 0x10,
+            name: "docs".into(),
+            version: 2,
+        };
+        let ev = to_change_event(&rec).unwrap();
+        assert_eq!(ev.kind, ChangeKind::Created);
+        assert!(ev.is_dir);
+        assert_eq!(ev.file_ref, FileRef(30));
+
+        rec.reason = crate::reason::RENAME_OLD_NAME;
+        assert!(to_change_event(&rec).is_none(), "只有旧名的记录应被忽略");
+
+        rec.reason = crate::reason::FILE_DELETE | crate::reason::CLOSE;
+        assert_eq!(to_change_event(&rec).unwrap().kind, ChangeKind::Deleted);
     }
 
     #[test]
