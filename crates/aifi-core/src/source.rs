@@ -54,6 +54,7 @@ pub fn build_index<S: VolumeSource + ?Sized>(src: &mut S) -> Result<(VolumeIndex
     if let Some(e) = err {
         return Err(e);
     }
+    idx.resolve_parents();
     Ok((idx, cursor))
 }
 

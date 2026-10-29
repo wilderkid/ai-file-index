@@ -21,6 +21,7 @@ tracing-subscriber.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 aifi-ntfs.workspace = true
+windows = { workspace = true, features = ["Win32_Security", "Win32_Security_Authorization", "Win32_Foundation"] }
 windows-service.workspace = true
 tokio.workspace = true
 

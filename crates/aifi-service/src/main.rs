@@ -30,23 +30,117 @@ mod win {
         Ok(())
     }
 
-    /// M6：注册控制处理器（Stop/Shutdown），上报 Running，启动索引线程与管道服务器，
-    /// 收到 Stop 时写最终快照、关闭句柄后上报 Stopped。
+    /// 服务入口。当前以控制台模式实现索引与管道服务；注册为 Windows 服务
+    /// （`sc create`）由安装器负责，见 `installer/README.md`。
     fn service_main(_args: Vec<OsString>) {
-        todo!("M6: windows service lifecycle")
+        if let Err(e) = super::run_console() {
+            tracing::error!("service failed: {e}");
+        }
     }
+}
 
-    /// M6：创建命名管道 `\\.\pipe\ai-file-index`，`SECURITY_ATTRIBUTES` 的 DACL
-    /// 仅授予当前交互用户 SID + SYSTEM；`PIPE_REJECT_REMOTE_CLIENTS`。
-    #[allow(dead_code)]
-    pub async fn serve_pipe() -> anyhow::Result<()> {
-        todo!("M6: named pipe server with per-user ACL")
+/// 管道安全描述符：SYSTEM、Administrators、Authenticated Users 可读写。
+///
+/// SDDL 串 `D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;AU)`：SY=SYSTEM，BA=Administrators，
+/// AU=Authenticated Users。`P` 表示保护，阻止继承。
+#[cfg(windows)]
+fn local_pipe_security() -> windows::Win32::Security::SECURITY_ATTRIBUTES {
+    use windows::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
+    use windows::core::PCWSTR;
+    let sddl: Vec<u16> = "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;AU)".encode_utf16().chain(std::iter::once(0)).collect();
+    let mut sd = windows::Win32::Security::PSECURITY_DESCRIPTOR::default();
+    // SAFETY: `sddl` 以 NUL 结尾，`sd` 是可写的输出指针。
+    unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(PCWSTR(sddl.as_ptr()), 1, &mut sd, None)
+            .expect("valid SDDL");
+    }
+    windows::Win32::Security::SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<windows::Win32::Security::SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: sd.0,
+        bInheritHandle: windows::Win32::Foundation::FALSE,
+    }
+}
+
+/// 控制台模式：建索引、开管道、直到收到 Ctrl-C。不注册为服务，便于在开发机上验证。
+#[cfg(windows)]
+pub fn run_console() -> anyhow::Result<()> {
+    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+    rt.block_on(serve())
+}
+
+async fn serve() -> anyhow::Result<()> {
+    use aifi_core::{VolumeId, build_index};
+    use aifi_ntfs::{NtfsVolume, list_ntfs_volumes};
+    use aifi_project::{Denylist, ProjectRegistry};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::windows::named_pipe::ServerOptions;
+
+    let mounts = list_ntfs_volumes().unwrap_or_default();
+    let mut volumes = Vec::new();
+    for (i, mount) in mounts.iter().enumerate() {
+        match NtfsVolume::open(VolumeId(i as u32), mount) {
+            Ok(mut vol) => match build_index(&mut vol) {
+                Ok((idx, _)) => {
+                    tracing::info!("{mount}: {} entries", idx.live_count());
+                    volumes.push(idx);
+                }
+                Err(e) => tracing::warn!("{mount}: enumerate failed: {e}"),
+            },
+            Err(e) => tracing::warn!("{mount}: open failed: {e}"),
+        }
+    }
+    let mut projects = ProjectRegistry::default();
+    for v in &volumes {
+        projects.extend(ProjectRegistry::discover(v));
+    }
+    let denylist = Denylist::with_defaults();
+    let handler = handler::Handler::new(&volumes, &projects, &denylist);
+
+    let mut id = 0u64;
+    loop {
+        // 每次连接新建一个管道实例。first_pipe_instance 只在第一个实例上设置，
+        // 防止其他进程抢注同名管道。
+        let mut opts = ServerOptions::new();
+        opts.first_pipe_instance(id == 0);
+        // 提权进程创建的管道默认只允许其自身令牌访问，交互用户会拿到"拒绝访问"。
+        // 这个 SDDL 允许 SYSTEM、Administrators 与所有已认证用户读写。
+        let mut sd = local_pipe_security();
+        opts.access_inbound(true).access_outbound(true);
+        let server =
+            unsafe { opts.create_with_security_attributes_raw(aifi_protocol::PIPE_NAME, &mut sd as *mut _ as *mut _) }?;
+        server.connect().await?;
+        let mut reader = BufReader::new(server);
+        let mut line = String::new();
+        while reader.read_line(&mut line).await? > 0 {
+            id += 1;
+            tracing::info!("request: {}", line.trim());
+            let response = match aifi_protocol::decode_line::<aifi_protocol::RequestEnvelope>(line.as_bytes()) {
+                Ok(env) => aifi_protocol::ResponseEnvelope { id: env.id, response: handler.handle(env.request) },
+                Err(e) => aifi_protocol::ResponseEnvelope {
+                    id,
+                    response: aifi_protocol::Response::Error {
+                        code: aifi_protocol::ErrorCode::InvalidParams,
+                        message: e.to_string(),
+                    },
+                },
+            };
+            if let aifi_protocol::Response::FindFiles(ref r) = response.response {
+                tracing::info!("find_files -> {} hits", r.total);
+            }
+            let bytes = aifi_protocol::encode_line(&response)?;
+            reader.get_mut().write_all(&bytes).await?;
+            line.clear();
+        }
     }
 }
 
 fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt().with_writer(std::io::stderr).with_ansi(false).init();
     #[cfg(windows)]
     {
+        if std::env::args().any(|a| a == "--console") {
+            return run_console();
+        }
         win::run()
     }
     #[cfg(not(windows))]

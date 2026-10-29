@@ -82,6 +82,7 @@ impl<'a> Handler<'a> {
         let ctx = QueryContext { denylist: self.denylist, tier: &tier, max_tier, gitignored: None };
         let limit = clamp_limit(p.limit) as usize;
         let refs: Vec<&VolumeIndex> = self.volumes.iter().collect();
+        tracing::info!("searching {} volumes, query {:?}", refs.len(), q.spec().text);
         let page = search(&refs, &q, &ctx, limit, p.cursor.as_deref());
 
         Response::FindFiles(FindFilesResult {

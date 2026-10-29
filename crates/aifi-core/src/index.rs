@@ -122,6 +122,24 @@ impl VolumeIndex {
         &self.arena
     }
 
+    /// 补全父节点下标。
+    ///
+    /// 枚举顺序不保证父先于子，插入时父可能还不存在。全量建完后调用一次，
+    /// 把所有父已在索引中、但 `parent_id` 仍是占位值的节点补上。
+    pub fn resolve_parents(&mut self) {
+        for i in 0..self.nodes.len() {
+            if self.nodes[i].is_deleted() || self.nodes[i].parent_id != u32::MAX {
+                continue;
+            }
+            if self.nodes[i].parent == self.info.root {
+                continue;
+            }
+            if let Some(&pid) = self.by_ref.get(&self.nodes[i].parent) {
+                self.nodes[i].parent_id = pid.0;
+            }
+        }
+    }
+
     /// 节点表（含墓碑）。只供快照序列化使用。
     pub fn nodes_raw(&self) -> &[Node] {
         &self.nodes
@@ -260,7 +278,9 @@ impl VolumeIndex {
                 break;
             }
             parts.push(self.arena.get(cur.name));
-            if cur.parent == root {
+            // 根目录的 FRN 低 48 位是 5，高 16 位是序列号，枚举结果里不会出现根节点本身。
+            // 父引用的低 48 位为 5 即视为到达卷根。
+            if cur.parent == root || cur.parent.0 & 0x0000_FFFF_FFFF_FFFF == root.0 & 0x0000_FFFF_FFFF_FFFF {
                 break;
             }
             // 父下标缺失说明父节点还没到（孤儿），或数据损坏。
