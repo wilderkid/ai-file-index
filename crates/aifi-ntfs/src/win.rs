@@ -14,8 +14,10 @@ use windows::Win32::Storage::FileSystem::{
 };
 use windows::Win32::System::IO::DeviceIoControl;
 use windows::Win32::System::Ioctl::{
-    FSCTL_ENUM_USN_DATA, FSCTL_QUERY_USN_JOURNAL, FSCTL_READ_USN_JOURNAL, MFT_ENUM_DATA_V1, READ_USN_JOURNAL_DATA_V1,
-    USN_JOURNAL_DATA_V0,
+    FSCTL_ENUM_USN_DATA, FSCTL_QUERY_FILE_LAYOUT, FSCTL_QUERY_USN_JOURNAL, FSCTL_READ_USN_JOURNAL, MFT_ENUM_DATA_V1,
+    QUERY_FILE_LAYOUT_FILTER_TYPE_NONE, QUERY_FILE_LAYOUT_INCLUDE_EXTRA_INFO, QUERY_FILE_LAYOUT_INCLUDE_NAMES,
+    QUERY_FILE_LAYOUT_INCLUDE_STREAMS, QUERY_FILE_LAYOUT_INCLUDE_STREAMS_WITH_NO_CLUSTERS_ALLOCATED,
+    QUERY_FILE_LAYOUT_INPUT, QUERY_FILE_LAYOUT_RESTART, READ_USN_JOURNAL_DATA_V1, USN_JOURNAL_DATA_V0,
 };
 use windows::Win32::System::WindowsProgramming::DRIVE_FIXED;
 use windows::core::PCWSTR;
@@ -210,6 +212,56 @@ impl VolumeSource for NtfsVolume {
             }
         }
         Ok(JournalCursor { journal_id: from.journal_id, next_usn: next })
+    }
+}
+
+impl NtfsVolume {
+    /// 用 `FSCTL_QUERY_FILE_LAYOUT` 全量枚举：除名字外还带大小与修改时间。
+    ///
+    /// 只读 IOCTL。返回的游标取自枚举开始前，与 [`VolumeSource::enumerate`] 语义相同。
+    /// 卷不支持（如较旧的系统）时返回错误，调用方应退回 `enumerate`。
+    pub fn enumerate_layout(&mut self, sink: &mut dyn FnMut(FileRecord)) -> Result<JournalCursor> {
+        let journal = query_journal(self.handle)?;
+        let mut buf = vec![0u8; ENUM_BUF];
+        let mut flags = QUERY_FILE_LAYOUT_RESTART
+            | QUERY_FILE_LAYOUT_INCLUDE_NAMES
+            | QUERY_FILE_LAYOUT_INCLUDE_STREAMS
+            | QUERY_FILE_LAYOUT_INCLUDE_EXTRA_INFO
+            | QUERY_FILE_LAYOUT_INCLUDE_STREAMS_WITH_NO_CLUSTERS_ALLOCATED;
+        loop {
+            let input = QUERY_FILE_LAYOUT_INPUT {
+                Flags: flags,
+                FilterType: QUERY_FILE_LAYOUT_FILTER_TYPE_NONE,
+                ..Default::default()
+            };
+            // 只有第一次带 RESTART：之后同一句柄上的调用接着上次的位置继续。
+            flags &= !QUERY_FILE_LAYOUT_RESTART;
+            let mut returned = 0u32;
+            // SAFETY: `input` 是合法的 QUERY_FILE_LAYOUT_INPUT（无过滤器），`buf` 可写且长度与传入一致。
+            // 该 IOCTL 只读，不修改卷。
+            let res = unsafe {
+                DeviceIoControl(
+                    self.handle,
+                    FSCTL_QUERY_FILE_LAYOUT,
+                    Some((&input as *const QUERY_FILE_LAYOUT_INPUT).cast::<c_void>()),
+                    std::mem::size_of::<QUERY_FILE_LAYOUT_INPUT>() as u32,
+                    Some(buf.as_mut_ptr().cast::<c_void>()),
+                    buf.len() as u32,
+                    Some(&mut returned),
+                    None,
+                )
+            };
+            if let Err(e) = res {
+                if e.code() == ERROR_HANDLE_EOF.to_hresult() {
+                    break;
+                }
+                return Err(aifi_core::Error::Platform(format!("FSCTL_QUERY_FILE_LAYOUT: {e}")));
+            }
+            let records = crate::layout::parse_file_layout(&buf[..returned as usize])
+                .map_err(|e| aifi_core::Error::Platform(format!("file layout: {e}")))?;
+            records.into_iter().for_each(&mut *sink);
+        }
+        Ok(JournalCursor { journal_id: journal.UsnJournalID, next_usn: journal.NextUsn })
     }
 }
 

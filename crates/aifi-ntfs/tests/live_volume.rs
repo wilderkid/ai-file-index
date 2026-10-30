@@ -86,6 +86,60 @@ fn read_changes_sees_a_created_file_within_a_second() {
     eprintln!("probe.txt visible after {:.0} ms", start.elapsed().as_secs_f64() * 1000.0);
 }
 
+/// `FSCTL_QUERY_FILE_LAYOUT` 与 `FSCTL_ENUM_USN_DATA` 必须给出同一批 FRN，目录的 (父, 名字) 完全一致，
+/// 且绝大多数文件带大小与修改时间。卷在两次枚举之间会有少量变化，允许 0.1% 差异。
+///
+/// 文件可以不一致：硬链接（C: 上主要是 WinSxS ↔ System32）有多个名字，两个 IOCTL 各取其一，
+/// 而 v1 索引对每个 FRN 只保留一个链接。实测 C: 约 2.6% 的文件属于这种情况。
+#[test]
+#[ignore]
+fn layout_enumeration_matches_usn_enumeration_and_has_metadata() {
+    use std::collections::HashMap;
+
+    let mut vol = open_c();
+    let (mut usn, mut dirs) = (HashMap::new(), std::collections::HashSet::new());
+    let t = Instant::now();
+    vol.enumerate(&mut |r| {
+        if r.is_dir {
+            dirs.insert(r.file_ref);
+        }
+        usn.insert(r.file_ref, (r.parent, r.name.to_lowercase()));
+    })
+    .unwrap();
+    let usn_time = t.elapsed();
+
+    let (mut layout, mut files, mut sized, mut timed) = (HashMap::new(), 0u64, 0u64, 0u64);
+    let t = Instant::now();
+    vol.enumerate_layout(&mut |r| {
+        if !r.is_dir {
+            files += 1;
+            sized += u64::from(r.size.is_some());
+        }
+        timed += u64::from(r.modified.is_some());
+        layout.insert(r.file_ref, (r.parent, r.name.to_lowercase()));
+    })
+    .expect("FSCTL_QUERY_FILE_LAYOUT");
+    let layout_time = t.elapsed();
+
+    let only_usn: Vec<_> = usn.iter().filter(|(k, _)| !layout.contains_key(k)).take(5).collect();
+    let only_layout: Vec<_> = layout.iter().filter(|(k, _)| !usn.contains_key(k)).take(5).collect();
+    let differ = usn.iter().filter(|(k, v)| layout.get(k).is_some_and(|l| l != *v)).count();
+    let dirs_differ: Vec<_> =
+        usn.iter().filter(|(k, v)| dirs.contains(k) && layout.get(k).is_some_and(|l| l != *v)).take(5).collect();
+    eprintln!(
+        "usn {} in {usn_time:?}; layout {} in {layout_time:?}; files {files}, sized {sized}, timed {timed}; \
+         name/parent differ {differ}\n only in usn: {only_usn:?}\n only in layout: {only_layout:?}",
+        usn.len(),
+        layout.len()
+    );
+    let tolerance = usn.len() / 1000 + 10;
+    assert!(usn.len().abs_diff(layout.len()) <= tolerance);
+    assert!(dirs_differ.len() <= 1, "directories must agree on parent and name: {dirs_differ:?}");
+    assert!(differ * 20 <= usn.len(), "{differ} files disagree, far more than hardlinks explain");
+    assert!(sized * 100 >= files * 99, "almost every file should have a size");
+    assert!(timed as usize * 100 >= layout.len() * 99, "almost every entry should have a time");
+}
+
 #[test]
 #[ignore]
 fn list_volumes_includes_c() {

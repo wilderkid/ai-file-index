@@ -79,6 +79,9 @@ pub mod reason {
 /// `USN_RECORD_V2/V3` 缓冲区的平台无关解析。
 pub mod parse;
 
+/// `FSCTL_QUERY_FILE_LAYOUT` 输出的平台无关解析（带大小与修改时间的全量枚举）。
+pub mod layout;
+
 #[cfg(windows)]
 mod win;
 
