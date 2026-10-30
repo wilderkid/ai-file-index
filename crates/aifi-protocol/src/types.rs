@@ -54,6 +54,19 @@ pub enum EntryKind {
     Dir,
 }
 
+/// 结果排序方式。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SortBy {
+    /// 匹配质量 + 项目分层（默认）。
+    #[default]
+    Relevance,
+    /// 修改时间，新的在前；时间未知的排最后。
+    Modified,
+    /// 文件大小，大的在前；大小未知的排最后。
+    Size,
+}
+
 /// `find_files` 参数。
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct FindFilesParams {
@@ -80,6 +93,23 @@ pub struct FindFilesParams {
     /// 分页游标（上一页响应里的 `next_cursor`）。
     #[serde(default)]
     pub cursor: Option<String>,
+    /// 只在这个目录（任意已索引目录或盘符，如 `E:\`）之下搜索。给出时忽略 `scope`。
+    #[serde(default)]
+    pub under: Option<String>,
+    /// 最小文件大小（字节，含）。给出大小条件时不返回目录。
+    #[serde(default)]
+    pub min_size: Option<u64>,
+    /// 最大文件大小（字节，含）。
+    #[serde(default)]
+    pub max_size: Option<u64>,
+    /// 只要这个 Unix 时间（秒）之后修改过的。
+    #[serde(default)]
+    pub modified_after: Option<i64>,
+    /// 只要这个 Unix 时间（秒）之前修改的。
+    #[serde(default)]
+    pub modified_before: Option<i64>,
+    #[serde(default)]
+    pub sort: SortBy,
 }
 
 /// `list_project_tree` 参数。

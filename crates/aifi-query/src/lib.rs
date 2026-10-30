@@ -7,9 +7,10 @@
 //! 打分 = 匹配质量（精确 > 前缀 > 子串 > 拼音 > glob/regex）+ 路径分层（当前项目最优先）
 //! + 名字越短越好 + 越新越好（轻微）。
 
+use aifi_core::index::Node;
 use aifi_core::{NodeId, VolumeIndex};
 use aifi_project::{Denylist, RankTier};
-use aifi_protocol::{EntryKind, MatchMode};
+use aifi_protocol::{EntryKind, MatchMode, SortBy};
 use memchr::memmem;
 
 #[derive(Debug, thiserror::Error)]
@@ -73,6 +74,13 @@ pub struct QuerySpec {
     pub include_ignored: bool,
     /// 是否启用拼音匹配（服务端能力开关）。
     pub pinyin: bool,
+    /// 大小范围（字节，含两端）。给出任一端时，目录与大小未知的文件都不命中。
+    pub min_size: Option<u64>,
+    pub max_size: Option<u64>,
+    /// 修改时间范围（Unix 秒，含两端）。给出任一端时，时间未知的条目不命中。
+    pub modified_after: Option<i64>,
+    pub modified_before: Option<i64>,
+    pub sort: SortBy,
 }
 
 enum Engine {
@@ -161,6 +169,35 @@ impl CompiledQuery {
             Engine::Glob(g) => g.is_match(name).then_some(MatchKind::Glob),
             Engine::Regex(r) => r.is_match(name).then_some(MatchKind::Regex),
             Engine::Fuzzy { atom } => fuzzy_match(atom, name),
+        }
+    }
+
+    /// 只看元数据的过滤。比名字匹配便宜，先做。
+    fn passes_metadata(&self, node: &Node) -> bool {
+        let s = &self.spec;
+        if s.min_size.is_some() || s.max_size.is_some() {
+            let Some(size) = node.size().filter(|_| !node.is_dir()) else { return false };
+            if s.min_size.is_some_and(|m| size < m) || s.max_size.is_some_and(|m| size > m) {
+                return false;
+            }
+        }
+        if s.modified_after.is_some() || s.modified_before.is_some() {
+            let Some(t) = node.modified() else { return false };
+            if s.modified_after.is_some_and(|a| t < a) || s.modified_before.is_some_and(|b| t > b) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// 排序键，越大越靠前。时间、大小未知的排最后。
+    ///
+    /// 用 f64：Unix 秒与文件大小都远小于 2^53，能精确表示，且能直接放进分页游标。
+    fn sort_key(&self, score: f32, node: &Node) -> f64 {
+        match self.spec.sort {
+            SortBy::Relevance => score as f64,
+            SortBy::Modified => node.modified().map_or(f64::NEG_INFINITY, |t| t as f64),
+            SortBy::Size => node.size().filter(|_| !node.is_dir()).map_or(f64::NEG_INFINITY, |s| s as f64),
         }
     }
 
@@ -256,6 +293,8 @@ pub struct Hit {
     pub kind: MatchKind,
     pub tier: RankTier,
     pub score: f32,
+    /// 排序键（见 `CompiledQuery::sort_key`），也写进分页游标。
+    pub key: f64,
 }
 
 /// `.gitignore` 判定回调：`(绝对路径, 是否目录) -> 是否忽略`。
@@ -299,7 +338,7 @@ fn consider(
     acc: (Vec<Hit>, u64),
 ) -> (Vec<Hit>, u64) {
     let node = idx.node(id);
-    if node.is_deleted() {
+    if node.is_deleted() || !q.passes_metadata(node) {
         return acc;
     }
     let name = idx.name(id);
@@ -337,26 +376,79 @@ fn consider(
         kind,
         tier,
         score: s,
+        key: q.sort_key(s, node),
     });
     (hits, total + 1)
 }
 
-/// 在一个卷上执行候选阶段，返回按分数降序的前 `limit` 条以及总命中数。
+/// 在一个卷上执行候选阶段，返回按排序键降序的前 `limit` 条以及总命中数。
 pub fn search_volume(idx: &VolumeIndex, q: &CompiledQuery, ctx: &QueryContext<'_>, limit: usize) -> (Vec<Hit>, u64) {
+    search_scan(idx, q, ctx, limit, Scan::Volume)
+}
+
+/// 一个卷上的扫描范围。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scan {
+    /// 整卷。
+    Volume,
+    /// 某个目录的子树（不含目录本身）。
+    Subtree(NodeId),
+}
+
+fn search_scan(
+    idx: &VolumeIndex,
+    q: &CompiledQuery,
+    ctx: &QueryContext<'_>,
+    limit: usize,
+    scan: Scan,
+) -> (Vec<Hit>, u64) {
     use rayon::prelude::*;
-    let chunks: Vec<(Vec<Hit>, u64)> = (0..idx.node_count())
-        .into_par_iter()
-        .fold(|| (Vec::new(), 0u64), |acc, i| consider(idx, q, ctx, NodeId(i as u32), acc))
-        .collect();
+    let fold = |acc, id| consider(idx, q, ctx, id, acc);
+    let chunks: Vec<(Vec<Hit>, u64)> = match scan {
+        Scan::Volume => {
+            (0..idx.node_count() as u32).into_par_iter().map(NodeId).fold(|| (Vec::new(), 0), fold).collect()
+        }
+        Scan::Subtree(root) => descendants(idx, root).into_par_iter().fold(|| (Vec::new(), 0), fold).collect(),
+    };
     let mut hits = Vec::new();
     let mut total = 0u64;
     for (h, t) in chunks {
         hits.extend(h);
         total += t;
     }
-    hits.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.path.cmp(&b.path)));
+    hits.sort_by(|a, b| b.key.total_cmp(&a.key).then_with(|| a.path.cmp(&b.path)));
     hits.truncate(limit);
     (hits, total)
+}
+
+/// 子树内的全部节点（不含根）。用显式栈，不递归；目录层级受 NTFS 路径长度限制。
+fn descendants(idx: &VolumeIndex, root: NodeId) -> Vec<NodeId> {
+    let mut out = Vec::new();
+    let mut stack: Vec<NodeId> = idx.children(root).collect();
+    while let Some(id) = stack.pop() {
+        out.push(id);
+        if idx.node(id).is_dir() {
+            stack.extend(idx.children(id));
+        }
+    }
+    out
+}
+
+/// 把 `under` 目录解析成每个卷的扫描范围；`None` 表示该卷不扫描。
+///
+/// 盘符根（`E:`、`E:\`）在索引里没有节点，解析为该卷整卷。不存在的路径或文件对所有卷都是 `None`。
+pub fn resolve_under(indexes: &[&VolumeIndex], under: &str) -> Vec<Option<Scan>> {
+    let trimmed = under.trim_end_matches(['\\', '/']);
+    indexes
+        .iter()
+        .map(|idx| {
+            if trimmed.eq_ignore_ascii_case(idx.info().mount.trim_end_matches(['\\', '/'])) {
+                Some(Scan::Volume)
+            } else {
+                idx.lookup_path(trimmed).filter(|&id| idx.node(id).is_dir()).map(Scan::Subtree)
+            }
+        })
+        .collect()
 }
 
 /// 一页搜索结果。
@@ -371,11 +463,11 @@ pub struct SearchPage {
 
 /// 游标指向"上一页最后一条"，按（分数降序, 路径升序, 卷下标, 节点号）定位，
 /// 因此插入或删除其他条目不会导致翻页重复或遗漏。
-fn encode_cursor(score: f32, path: &str, volume: usize, node: u32) -> String {
-    format!("{score}:{volume}:{node}:{path}")
+fn encode_cursor(key: f64, path: &str, volume: usize, node: u32) -> String {
+    format!("{key}:{volume}:{node}:{path}")
 }
 
-fn decode_cursor(c: &str) -> Option<(f32, usize, u32, &str)> {
+fn decode_cursor(c: &str) -> Option<(f64, usize, u32, &str)> {
     let (score, rest) = c.split_once(':')?;
     let (volume, rest) = rest.split_once(':')?;
     let (node, path) = rest.split_once(':')?;
@@ -383,16 +475,37 @@ fn decode_cursor(c: &str) -> Option<(f32, usize, u32, &str)> {
 }
 
 /// 当前条目是否严格排在游标之后（即属于下一页）。
-fn after_cursor(score: f32, path: &str, volume: usize, node: u32, cursor: (f32, usize, u32, &str)) -> bool {
-    (cursor.0, cursor.3, cursor.1, cursor.2) > (score, path, volume, node)
+///
+/// 比较顺序必须与 [`search_scoped`] 的排序一致：键降序 → 路径长度 → 路径 → 卷 → 节点。
+fn after_cursor(key: f64, path: &str, volume: usize, node: u32, cursor: (f64, usize, u32, &str)) -> bool {
+    let (ck, cv, cn, cp) = cursor;
+    ck.total_cmp(&key)
+        .then_with(|| path.len().cmp(&cp.len()))
+        .then_with(|| path.cmp(cp))
+        .then_with(|| volume.cmp(&cv))
+        .then_with(|| node.cmp(&cn))
+        .is_gt()
 }
 
 /// 在多个卷上执行候选阶段：并行扫描、稳定排序、游标分页。
 ///
-/// 排序键为分数降序，同分时路径短者优先，再按路径字典序。`cursor` 为上一页的
+/// 排序键降序，同键时路径短者优先，再按路径字典序。`cursor` 为上一页的
 /// `next_cursor`；传 `None` 取第一页。
 pub fn search(
     indexes: &[&VolumeIndex],
+    q: &CompiledQuery,
+    ctx: &QueryContext<'_>,
+    limit: usize,
+    cursor: Option<&str>,
+) -> SearchPage {
+    let all = vec![Some(Scan::Volume); indexes.len()];
+    search_scoped(indexes, &all, q, ctx, limit, cursor)
+}
+
+/// 同 [`search`]，但第 i 个卷只扫描 `scans[i]`（见 [`resolve_under`]）。
+pub fn search_scoped(
+    indexes: &[&VolumeIndex],
+    scans: &[Option<Scan>],
     q: &CompiledQuery,
     ctx: &QueryContext<'_>,
     limit: usize,
@@ -406,9 +519,10 @@ pub fn search(
         .collect::<Vec<_>>()
         .into_par_iter()
         .map(|(vol, idx)| {
-            let (mut hits, total) = search_volume(idx, q, ctx, usize::MAX);
+            let Some(scan) = scans.get(vol).copied().flatten() else { return (Vec::new(), 0) };
+            let (mut hits, total) = search_scan(idx, q, ctx, usize::MAX, scan);
             if let Some(c) = cursor {
-                hits.retain(|h| after_cursor(h.score, &h.path, vol, h.node.0, c));
+                hits.retain(|h| after_cursor(h.key, &h.path, vol, h.node.0, c));
             }
             (hits, total)
         })
@@ -418,18 +532,19 @@ pub fn search(
     let mut hits: Vec<(usize, Hit)> =
         parts.into_iter().enumerate().flat_map(|(vol, (hs, _))| hs.into_iter().map(move |h| (vol, h))).collect();
     hits.sort_by(|(va, a), (vb, b)| {
-        b.score
-            .total_cmp(&a.score)
+        b.key
+            .total_cmp(&a.key)
             .then_with(|| a.path.len().cmp(&b.path.len()))
             .then_with(|| a.path.cmp(&b.path))
             .then_with(|| va.cmp(vb))
+            .then_with(|| a.node.cmp(&b.node))
     });
 
     let more = hits.len() > limit;
     hits.truncate(limit);
     let next_cursor = more.then(|| {
         let (vol, last) = hits.last().expect("limit > 0 when more results exist");
-        encode_cursor(last.score, &last.path, *vol, last.node.0)
+        encode_cursor(last.key, &last.path, *vol, last.node.0)
     });
     SearchPage { hits: hits.into_iter().map(|(_, h)| h).collect(), total, next_cursor }
 }
@@ -612,6 +727,8 @@ mod tests {
 
     #[test]
     fn cursor_roundtrip() {
+        assert_eq!(decode_cursor(&encode_cursor(f64::NEG_INFINITY, "p", 0, 0)).map(|c| c.0), Some(f64::NEG_INFINITY));
+        assert_eq!(decode_cursor(&encode_cursor(1_793_354_599.0, "p", 0, 0)).map(|c| c.0), Some(1_793_354_599.0));
         let c = encode_cursor(12.5, r"C:\a\b.txt", 1, 7);
         assert_eq!(decode_cursor(&c), Some((12.5, 1, 7, r"C:\a\b.txt")));
         assert_eq!(decode_cursor("garbage"), None);
@@ -639,6 +756,142 @@ mod tests {
         }
         assert_eq!(paged, all.hits, "分页拼接应与一次取完全部一致");
         assert_eq!(all.total, all.hits.len() as u64);
+    }
+
+    /// `E:\media\` 下几个带大小与时间的文件，外加 `E:\docs\` 下一个同名文件。
+    fn media_index() -> VolumeIndex {
+        let mut v = VolumeIndex::new(VolumeInfo {
+            id: VolumeId(1),
+            mount: "E:".into(),
+            fs: FsKind::Ntfs,
+            serial: 2,
+            root: FileRef::NTFS_ROOT,
+        });
+        let mut n = 100u64;
+        let mut add = |v: &mut VolumeIndex, parent: u64, name: &str, size: Option<u64>, t: Option<i64>| {
+            n += 1;
+            v.insert(&FileRecord {
+                file_ref: FileRef(n),
+                parent: FileRef(parent),
+                name: name.into(),
+                is_dir: size.is_none() && t.is_none(),
+                size,
+                modified: t,
+            })
+            .unwrap();
+            n
+        };
+        let media = add(&mut v, 5, "media", None, None);
+        add(&mut v, media, "trip.mp4", Some(3_000_000_000), Some(1_000));
+        add(&mut v, media, "clip.mp4", Some(20_000_000), Some(3_000));
+        add(&mut v, media, "old.mp4", Some(2_000_000_000), Some(500));
+        add(&mut v, media, "unknown.mp4", None, Some(4_000));
+        let docs = add(&mut v, 5, "docs", None, None);
+        add(&mut v, docs, "trip.mp4", Some(5_000_000_000), Some(2_000));
+        v
+    }
+
+    fn media_search(spec: QuerySpec, under: Option<&str>, limit: usize, cursor: Option<&str>) -> SearchPage {
+        let idx = media_index();
+        let deny = Denylist::with_defaults();
+        let tier = |_: &str| RankTier::Other;
+        let ctx = QueryContext { denylist: &deny, tier: &tier, max_tier: RankTier::Other, gitignored: None };
+        let q = CompiledQuery::compile(spec).unwrap();
+        let scans = match under {
+            Some(u) => resolve_under(&[&idx], u),
+            None => vec![Some(Scan::Volume)],
+        };
+        search_scoped(&[&idx], &scans, &q, &ctx, limit, cursor)
+    }
+
+    fn names(page: &SearchPage) -> Vec<&str> {
+        page.hits.iter().map(|h| h.path.as_str()).collect()
+    }
+
+    #[test]
+    fn size_and_time_filters() {
+        let gb = 1_000_000_000;
+        let page =
+            media_search(QuerySpec { text: "*.mp4".into(), min_size: Some(gb), ..Default::default() }, None, 10, None);
+        let mut got = names(&page);
+        got.sort();
+        assert_eq!(got, vec![r"E:\docs\trip.mp4", r"E:\media\old.mp4", r"E:\media\trip.mp4"], "大小未知的不命中");
+
+        let page = media_search(
+            QuerySpec {
+                text: "*.mp4".into(),
+                modified_after: Some(1_000),
+                modified_before: Some(3_000),
+                ..Default::default()
+            },
+            None,
+            10,
+            None,
+        );
+        assert_eq!(page.total, 3, "{:?}", names(&page));
+
+        // 目录本身没有大小，给出大小条件时不返回目录。
+        let page = media_search(
+            QuerySpec { text: "media".into(), max_size: Some(u64::MAX), ..Default::default() },
+            None,
+            10,
+            None,
+        );
+        assert!(page.hits.is_empty());
+    }
+
+    #[test]
+    fn under_limits_to_subtree_or_whole_volume() {
+        let spec = || QuerySpec { text: "trip".into(), ..Default::default() };
+        assert_eq!(names(&media_search(spec(), Some(r"E:\media"), 10, None)), vec![r"E:\media\trip.mp4"]);
+        assert_eq!(media_search(spec(), Some(r"e:\MEDIA\"), 10, None).total, 1, "大小写与结尾分隔符不敏感");
+        assert_eq!(media_search(spec(), Some(r"E:\"), 10, None).total, 2, "盘符根 = 整卷");
+        assert_eq!(media_search(spec(), Some(r"E:\nope"), 10, None).total, 0);
+        assert_eq!(media_search(spec(), Some(r"E:\media\trip.mp4"), 10, None).total, 0, "文件不是目录");
+    }
+
+    #[test]
+    fn sort_by_modified_and_size_with_unknowns_last() {
+        let page = media_search(
+            QuerySpec { text: "*.mp4".into(), sort: SortBy::Modified, ..Default::default() },
+            None,
+            10,
+            None,
+        );
+        assert_eq!(
+            names(&page),
+            vec![
+                r"E:\media\unknown.mp4",
+                r"E:\media\clip.mp4",
+                r"E:\docs\trip.mp4",
+                r"E:\media\trip.mp4",
+                r"E:\media\old.mp4"
+            ]
+        );
+        let page =
+            media_search(QuerySpec { text: "*.mp4".into(), sort: SortBy::Size, ..Default::default() }, None, 10, None);
+        assert_eq!(names(&page).first(), Some(&r"E:\docs\trip.mp4"));
+        assert_eq!(names(&page).last(), Some(&r"E:\media\unknown.mp4"), "大小未知排最后");
+    }
+
+    #[test]
+    fn pagination_is_complete_for_every_sort() {
+        for sort in [SortBy::Relevance, SortBy::Modified, SortBy::Size] {
+            let spec = || QuerySpec { text: "*.mp4".into(), sort, ..Default::default() };
+            let all = media_search(spec(), None, 100, None);
+            let mut paged = Vec::new();
+            let mut cursor: Option<String> = None;
+            loop {
+                let page = media_search(spec(), None, 2, cursor.as_deref());
+                paged.extend(page.hits.iter().map(|h| h.path.clone()));
+                match page.next_cursor {
+                    Some(c) => cursor = Some(c),
+                    None => break,
+                }
+            }
+            let expected: Vec<String> = all.hits.iter().map(|h| h.path.clone()).collect();
+            assert_eq!(paged, expected, "{sort:?}");
+        }
     }
 
     #[test]
