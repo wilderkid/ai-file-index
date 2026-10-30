@@ -62,7 +62,7 @@ impl<'a> Handler<'a> {
 
     fn find_files(&self, p: aifi_protocol::FindFilesParams) -> Response {
         use aifi_protocol::{FindFilesResult, clamp_limit};
-        use aifi_query::{CompiledQuery, QueryContext, QuerySpec, search};
+        use aifi_query::{CompiledQuery, QueryContext, QuerySpec, Scan, resolve_under, search_scoped};
 
         let spec = QuerySpec {
             text: p.query,
@@ -71,15 +71,39 @@ impl<'a> Handler<'a> {
             extensions: p.extensions,
             include_ignored: p.include_ignored,
             pinyin: true,
+            min_size: p.min_size,
+            max_size: p.max_size,
+            modified_after: p.modified_after,
+            modified_before: p.modified_before,
+            sort: p.sort,
         };
         let q = match CompiledQuery::compile(spec) {
             Ok(q) => q,
             Err(e) => return Response::Error { code: ErrorCode::InvalidParams, message: e.to_string() },
         };
+        let refs: Vec<&VolumeIndex> = self.volumes.iter().map(|s| &s.index).collect();
+        // `under` 给出时只扫描那个子树，`scope` 不再起作用。
+        let scans = match p.under.as_deref() {
+            Some(u) if self.denylist.is_denied(u) => {
+                return Response::Error { code: ErrorCode::Denied, message: "path denied".into() };
+            }
+            Some(u) => {
+                let scans = resolve_under(&refs, u);
+                if scans.iter().all(Option::is_none) {
+                    return Response::Error {
+                        code: ErrorCode::InvalidParams,
+                        message: "`under` is not an indexed directory".into(),
+                    };
+                }
+                scans
+            }
+            None => vec![Some(Scan::Volume); refs.len()],
+        };
         let current = p.cwd.as_deref().and_then(|c| self.projects.resolve(c)).map(|proj| proj.root.clone());
         let tier = |path: &str| aifi_project::rank_tier(path, current.as_deref(), &self.projects.roots(), None);
         // 请求项目范围但没有 cwd（或 cwd 不在任何项目里）时，退回全盘并在结果里说明。
         let (max_tier, effective_scope) = match p.scope {
+            _ if p.under.is_some() => (aifi_project::RankTier::Other, aifi_protocol::Scope::Disk),
             aifi_protocol::Scope::Project if current.is_some() => {
                 (aifi_project::RankTier::CurrentProject, aifi_protocol::Scope::Project)
             }
@@ -88,9 +112,7 @@ impl<'a> Handler<'a> {
         };
         let ctx = QueryContext { denylist: self.denylist, tier: &tier, max_tier, gitignored: None };
         let limit = clamp_limit(p.limit) as usize;
-        let refs: Vec<&VolumeIndex> = self.volumes.iter().map(|s| &s.index).collect();
-        tracing::info!("searching {} volumes, query {:?}", refs.len(), q.spec().text);
-        let page = search(&refs, &q, &ctx, limit, p.cursor.as_deref());
+        let page = search_scoped(&refs, &scans, &q, &ctx, limit, p.cursor.as_deref());
 
         Response::FindFiles(FindFilesResult {
             hits: page
@@ -274,6 +296,35 @@ mod tests {
             ..Default::default()
         })) {
             Response::FindFiles(r) => assert!(r.hits.is_empty(), "denylisted file must not be returned"),
+            r => panic!("{r:?}"),
+        }
+    }
+
+    #[test]
+    fn under_restricts_search_and_rejects_bad_paths() {
+        let (slot, projects, deny) = setup();
+        let slots = [&slot];
+        let h = Handler::new(&slots, &projects, &deny);
+        let find = |under: &str| {
+            h.handle(Request::FindFiles(aifi_protocol::FindFilesParams {
+                query: "main.rs".into(),
+                under: Some(under.into()),
+                ..Default::default()
+            }))
+        };
+        match find(r"C:\src\aifi") {
+            Response::FindFiles(r) => {
+                assert!(!r.hits.is_empty());
+                assert!(r.hits.iter().all(|hit| hit.path.starts_with(r"C:\src\aifi\")), "{:?}", r.hits);
+            }
+            r => panic!("{r:?}"),
+        }
+        match find(r"C:\no\such") {
+            Response::Error { code, .. } => assert_eq!(code, ErrorCode::InvalidParams),
+            r => panic!("{r:?}"),
+        }
+        match find(r"C:\Users\me\.ssh") {
+            Response::Error { code, .. } => assert_eq!(code, ErrorCode::Denied),
             r => panic!("{r:?}"),
         }
     }

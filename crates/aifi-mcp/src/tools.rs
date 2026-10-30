@@ -34,7 +34,10 @@ pub fn tool_definitions() -> Vec<ToolDef> {
             name: FIND_FILES,
             description: "Find files/directories by name in milliseconds using the local NTFS index. \
                 Supports substring, Chinese pinyin and initials (e.g. 'jdbg' matches 季度报告), glob ('*.rs') and regex. \
-                Defaults to the current project inferred from `cwd`; use scope='all_projects' or 'disk' to widen. \
+                Defaults to the current project inferred from `cwd`; use scope='all_projects' or 'disk' to widen, \
+                or `under` to search one directory tree (e.g. under='E:\\', query='*.mp4', min_size=1000000000). \
+                Filter by min_size/max_size (bytes) and modified_after/modified_before (Unix seconds); \
+                sort='modified' or 'size' puts newest/largest first. \
                 Prefer this over recursive directory listing or shell `find`/`dir /s`.",
             input_schema: schema_of::<FindFilesParams>(),
         },

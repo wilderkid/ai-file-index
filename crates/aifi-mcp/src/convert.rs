@@ -37,7 +37,17 @@ pub fn render_text(resp: &Response) -> String {
             for h in &r.hits {
                 let kind = if h.is_dir { "dir" } else { "file" };
                 let by = h.matched_by.as_deref().unwrap_or("-");
-                out.push_str(&format!("{}\t{}\t{}\n", h.path, kind, by));
+                out.push_str(&format!("{}\t{}\t{}", h.path, kind, by));
+                // 元数据只在已知时输出，保持未知时与旧格式一致。
+                if let Some(size) = h.size.filter(|_| !h.is_dir) {
+                    out.push('\t');
+                    out.push_str(&human_size(size));
+                }
+                if let Some(t) = h.modified {
+                    out.push('\t');
+                    out.push_str(&utc_date(t));
+                }
+                out.push('\n');
             }
             if r.next_cursor.is_some() {
                 out.push_str("(more results; pass cursor)\n");
@@ -80,10 +90,87 @@ pub fn render_text(resp: &Response) -> String {
     }
 }
 
+/// 字节数转成 `1.5 GB` 这样的短文本（1000 进制，与资源管理器的"大小"列一致的量级感）。
+fn human_size(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut v = bytes as f64;
+    let mut i = 0;
+    while v >= 1000.0 && i + 1 < UNITS.len() {
+        v /= 1000.0;
+        i += 1;
+    }
+    if i == 0 { format!("{bytes} B") } else { format!("{v:.1} {}", UNITS[i]) }
+}
+
+/// Unix 秒转成 `YYYY-MM-DD HH:MM` (UTC)。不引入时间库：按 Howard Hinnant 的 civil_from_days 算法换算。
+fn utc_date(t: i64) -> String {
+    let days = t.div_euclid(86_400);
+    let secs = t.rem_euclid(86_400);
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!("{y:04}-{m:02}-{d:02} {:02}:{:02}Z", secs / 3600, secs % 3600 / 60)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use aifi_protocol::{FileHit, FindFilesParams, FindFilesResult, Scope};
+
+    #[test]
+    fn human_size_and_utc_date() {
+        assert_eq!(human_size(512), "512 B");
+        assert_eq!(human_size(1_500_000_000), "1.5 GB");
+        assert_eq!(utc_date(0), "1970-01-01 00:00Z");
+        assert_eq!(utc_date(1_700_000_000), "2023-11-14 22:13Z");
+        assert_eq!(utc_date(951_782_400), "2000-02-29 00:00Z", "闰日");
+    }
+
+    #[test]
+    fn metadata_is_rendered_when_known() {
+        let hit = FileHit {
+            path: r"E:\media\trip.mp4".into(),
+            rel_path: None,
+            is_dir: false,
+            size: Some(3_000_000_000),
+            modified: Some(1_700_000_000),
+            project_root: None,
+            matched_by: Some("glob".into()),
+            score: 1.0,
+        };
+        let resp = Response::FindFiles(FindFilesResult {
+            total: 1,
+            hits: vec![hit],
+            next_cursor: None,
+            effective_scope: Scope::Disk,
+            warnings: Vec::new(),
+        });
+        assert!(render_text(&resp).contains("E:\\media\\trip.mp4\tfile\tglob\t3.0 GB\t2023-11-14 22:13Z\n"));
+    }
+
+    #[test]
+    fn new_filter_fields_parse_and_default() {
+        let r = request_from_tool(
+            FIND_FILES,
+            serde_json::json!({"query": "*.mp4", "under": "E:\\", "min_size": 1_000_000_000u64, "sort": "size"}),
+        )
+        .unwrap();
+        match r {
+            Request::FindFiles(p) => {
+                assert_eq!(p.under.as_deref(), Some("E:\\"));
+                assert_eq!(p.min_size, Some(1_000_000_000));
+                assert_eq!(p.sort, aifi_protocol::SortBy::Size);
+                assert_eq!(p.modified_after, None, "旧客户端不带的字段取默认值");
+            }
+            _ => unreachable!(),
+        }
+    }
 
     #[test]
     fn request_from_each_tool() {
