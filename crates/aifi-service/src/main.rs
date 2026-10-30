@@ -22,7 +22,14 @@ pub const SERVICE_DISPLAY_NAME: &str = "AI File Index";
 #[cfg(windows)]
 mod win {
     use std::ffi::OsString;
+    use std::sync::Arc;
+    use std::time::Duration;
 
+    use tokio::sync::Notify;
+    use windows_service::service::{
+        ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState, ServiceStatus, ServiceType,
+    };
+    use windows_service::service_control_handler::{self, ServiceControlHandlerResult, ServiceStatusHandle};
     use windows_service::{define_windows_service, service_dispatcher};
 
     define_windows_service!(ffi_service_main, service_main);
@@ -32,11 +39,73 @@ mod win {
         Ok(())
     }
 
-    /// 服务入口。当前以控制台模式实现索引与管道服务；注册为 Windows 服务
-    /// （`sc create`）由安装器负责，见 `installer/README.md`。
+    /// 服务入口：向 SCM 报告 StartPending（每建好一个卷推进一次 checkpoint）→ Running →
+    /// 收到 Stop / Preshutdown 后 StopPending → 写快照 → Stopped。
     fn service_main(_args: Vec<OsString>) {
-        if let Err(e) = super::run_console() {
-            tracing::error!("service failed: {e}");
+        let shutdown = Arc::new(Notify::new());
+        let notify = shutdown.clone();
+        let handler = move |control| match control {
+            ServiceControl::Stop | ServiceControl::Preshutdown => {
+                // notify_one 会保留一个许可，信号先于 serve 开始等待也不会丢。
+                notify.notify_one();
+                ServiceControlHandlerResult::NoError
+            }
+            ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
+            _ => ServiceControlHandlerResult::NotImplemented,
+        };
+        let status = match service_control_handler::register(super::SERVICE_NAME, handler) {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::error!("register service control handler: {e}");
+                return;
+            }
+        };
+
+        // 全量枚举一个大卷要 10 s 左右；每个卷推进 checkpoint，SCM 就不会判定启动超时。
+        let mut checkpoint = 0;
+        report(status, ServiceState::StartPending, 0, checkpoint, Duration::from_secs(60));
+        let progress = |ready: bool| {
+            checkpoint += 1;
+            if ready {
+                report(status, ServiceState::Running, 0, 0, Duration::ZERO);
+            } else {
+                report(status, ServiceState::StartPending, 0, checkpoint, Duration::from_secs(60));
+            }
+        };
+        let stopping = || report(status, ServiceState::StopPending, 0, 1, Duration::from_secs(30));
+
+        let result = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .map_err(anyhow::Error::from)
+            .and_then(|rt| rt.block_on(super::serve(shutdown, progress, stopping)));
+        let code = match result {
+            Ok(()) => 0,
+            Err(e) => {
+                tracing::error!("service failed: {e:#}");
+                // 非 0 退出码让 SCM 的失败重启策略生效。
+                1
+            }
+        };
+        report(status, ServiceState::Stopped, code, 0, Duration::ZERO);
+    }
+
+    fn report(h: ServiceStatusHandle, state: ServiceState, code: u32, checkpoint: u32, wait_hint: Duration) {
+        let controls_accepted = match state {
+            ServiceState::Running => ServiceControlAccept::STOP | ServiceControlAccept::PRESHUTDOWN,
+            _ => ServiceControlAccept::empty(),
+        };
+        let status = ServiceStatus {
+            service_type: ServiceType::OWN_PROCESS,
+            current_state: state,
+            controls_accepted,
+            exit_code: ServiceExitCode::Win32(code),
+            checkpoint,
+            wait_hint,
+            process_id: None,
+        };
+        if let Err(e) = h.set_service_status(status) {
+            tracing::warn!("set service status: {e}");
         }
     }
 }
@@ -89,7 +158,14 @@ fn snapshot_dir() -> anyhow::Result<std::path::PathBuf> {
 #[cfg(windows)]
 pub fn run_console() -> anyhow::Result<()> {
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
-    rt.block_on(serve())
+    let shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
+    let notify = shutdown.clone();
+    rt.spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            notify.notify_one();
+        }
+    });
+    rt.block_on(serve(shutdown, |_| {}, || {}))
 }
 
 /// 增量线程空闲时的轮询间隔。`architecture.md` 的预算是"创建 → 可搜到 < 1 s"。
@@ -105,8 +181,16 @@ const SNAPSHOT_EVERY: std::time::Duration = std::time::Duration::from_secs(600);
 #[cfg(windows)]
 const REDISCOVER_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// 建索引、跟踪增量、服务管道，直到 `shutdown` 被通知；退出前写快照。
+///
+/// `progress(false)` 在每个卷建好后调用，`progress(true)` 在开始接受连接时调用；
+/// `stopping` 在收到停止信号后、写快照前调用。服务模式用它们向 SCM 报告状态。
 #[cfg(windows)]
-async fn serve() -> anyhow::Result<()> {
+async fn serve(
+    shutdown: std::sync::Arc<tokio::sync::Notify>,
+    mut progress: impl FnMut(bool),
+    stopping: impl FnOnce(),
+) -> anyhow::Result<()> {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Instant;
@@ -138,6 +222,7 @@ async fn serve() -> anyhow::Result<()> {
             }
             Err(e) => tracing::warn!("{mount}: index failed: {e}"),
         }
+        progress(false);
     }
     let state = Arc::new(ServiceState::new(slots, Denylist::with_defaults()));
     // 启动时就写一次：全量扫描的结果立即落盘，下次启动走快照。
@@ -186,16 +271,19 @@ async fn serve() -> anyhow::Result<()> {
         }));
     }
 
-    tokio::select! {
-        r = serve_pipe(state.clone()) => r?,
-        _ = tokio::signal::ctrl_c() => tracing::info!("stopping"),
-    }
+    progress(true);
+    let result = tokio::select! {
+        r = serve_pipe(state.clone()) => r,
+        _ = shutdown.notified() => Ok(()),
+    };
+    tracing::info!("stopping");
+    stopping();
     stop.store(true, Ordering::Relaxed);
     for t in threads {
         let _ = t.join();
     }
     save_snapshots(&state, &store);
-    Ok(())
+    result
 }
 
 /// 为每个就绪的卷写快照。写失败只记日志：快照是加速手段，不影响正确性。
