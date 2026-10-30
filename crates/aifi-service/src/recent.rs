@@ -4,9 +4,7 @@
 //! 缓冲满了之后覆盖最旧的条目。
 
 use aifi_project::Denylist;
-use aifi_protocol::ChangeEntry;
-#[cfg(test)]
-use aifi_protocol::ChangeType;
+use aifi_protocol::{ChangeEntry, ChangeType};
 
 /// 默认每卷保留的条数。
 pub const DEFAULT_CAPACITY: usize = 10_000;
@@ -33,6 +31,15 @@ impl RecentLog {
         if entry.old_path.as_deref().is_some_and(|p| deny.is_denied(p)) {
             entry.old_path = None;
         }
+        // 日志类文件每秒改写多次：同一文件连续的"修改"只保留最新一条，免得挤掉其他变更。
+        if entry.change == ChangeType::Modified
+            && let Some(last) = self.newest_mut()
+            && last.change == ChangeType::Modified
+            && last.path == entry.path
+        {
+            last.timestamp = entry.timestamp;
+            return;
+        }
         if self.entries.len() < self.cap {
             self.entries.push(entry);
         } else {
@@ -47,9 +54,7 @@ impl RecentLog {
         let mut out = Vec::new();
         let total = self.len;
         for i in 0..total {
-            // 从最新往回走。
-            let idx = (self.next + self.cap - 1 - i) % self.entries.len().max(1);
-            let e = &self.entries[idx];
+            let e = &self.entries[self.slot_back(i)];
             if since.is_some_and(|s| e.timestamp < s) || !keep(&e.path) {
                 continue;
             }
@@ -59,6 +64,19 @@ impl RecentLog {
             out.push(e.clone());
         }
         (out, false)
+    }
+
+    /// 从最新往回数第 `i` 条所在的下标。未写满时 `next == entries.len()`，写满后在 `cap` 上回绕。
+    fn slot_back(&self, i: usize) -> usize {
+        (self.next + self.cap - 1 - i) % self.cap
+    }
+
+    fn newest_mut(&mut self) -> Option<&mut ChangeEntry> {
+        if self.len == 0 {
+            return None;
+        }
+        let idx = self.slot_back(0);
+        self.entries.get_mut(idx)
     }
 
     #[cfg(test)]
@@ -89,6 +107,33 @@ mod tests {
         let (recent, _) = log.recent(None, 10, |_| true);
         let paths: Vec<_> = recent.iter().map(|e| e.path.as_str()).collect();
         assert_eq!(paths, vec![r"C:\f4.txt", r"C:\f3.txt", r"C:\f2.txt"]);
+    }
+
+    #[test]
+    fn newest_first_before_the_buffer_is_full() {
+        // 回归：未写满时曾按 entries.len() 取模，容量不是条数整数倍时顺序错乱。
+        let deny = Denylist::with_defaults();
+        let mut log = RecentLog::new(1000);
+        for i in 0..7 {
+            log.push(entry(&format!(r"C:{i}.txt"), i), &deny);
+        }
+        let (recent, _) = log.recent(None, 3, |_| true);
+        let ts: Vec<_> = recent.iter().map(|e| e.timestamp).collect();
+        assert_eq!(ts, vec![6, 5, 4]);
+    }
+
+    #[test]
+    fn repeated_modifies_of_one_file_collapse() {
+        let deny = Denylist::with_defaults();
+        let mut log = RecentLog::new(10);
+        let modified = |ts| ChangeEntry { change: ChangeType::Modified, ..entry(r"C:pp.log", ts) };
+        log.push(entry(r"C:pp.log", 1), &deny);
+        log.push(modified(2), &deny);
+        log.push(modified(3), &deny);
+        log.push(modified(4), &deny);
+        let (recent, _) = log.recent(None, 10, |_| true);
+        let got: Vec<_> = recent.iter().map(|e| (e.change, e.timestamp)).collect();
+        assert_eq!(got, vec![(ChangeType::Modified, 4), (ChangeType::Created, 1)]);
     }
 
     #[test]
