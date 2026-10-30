@@ -213,6 +213,88 @@ impl VolumeSource for NtfsVolume {
         }
         Ok(JournalCursor { journal_id: from.journal_id, next_usn: next })
     }
+
+    /// 优先 `FSCTL_QUERY_FILE_LAYOUT`（带大小与时间）；不支持时退回 `FSCTL_ENUM_USN_DATA`。
+    ///
+    /// 布局枚举中途失败时已产出的记录可能不完整，所以只在一条都没产出时才退回。
+    fn enumerate_with_metadata(&mut self, sink: &mut dyn FnMut(FileRecord)) -> Result<JournalCursor> {
+        let mut emitted = 0usize;
+        match self.enumerate_layout(&mut |r| {
+            emitted += 1;
+            sink(r)
+        }) {
+            Ok(c) => Ok(c),
+            Err(e) if emitted == 0 => {
+                tracing::warn!("{}: {e}; falling back to FSCTL_ENUM_USN_DATA (no sizes)", self.info.mount);
+                self.enumerate(sink)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// `OpenFileById` 只请求 `FILE_READ_ATTRIBUTES`：不读内容、不改访问时间，也不会因为文件被独占打开而失败。
+    fn metadata(&mut self, file: FileRef) -> Option<(Option<u64>, Option<i64>)> {
+        use windows::Win32::Storage::FileSystem::{
+            FILE_BASIC_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_DESCRIPTOR,
+            FILE_ID_DESCRIPTOR_0, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_STANDARD_INFO, FileBasicInfo,
+            FileIdType, FileStandardInfo, GetFileInformationByHandleEx, OpenFileById,
+        };
+
+        let id = FILE_ID_DESCRIPTOR {
+            dwSize: std::mem::size_of::<FILE_ID_DESCRIPTOR>() as u32,
+            Type: FileIdType,
+            Anonymous: FILE_ID_DESCRIPTOR_0 { FileId: file.0 as i64 },
+        };
+        // SAFETY: `id` 是合法的 FILE_ID_DESCRIPTOR；卷句柄有效。只请求读属性，备份语义允许打开目录，
+        // 不跟随重解析点。返回的句柄由下面的 guard 关闭。
+        let h = unsafe {
+            OpenFileById(
+                self.handle,
+                &id,
+                FILE_READ_ATTRIBUTES.0,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                None,
+                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            )
+        }
+        .ok()?;
+        struct Guard(HANDLE);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                // SAFETY: 句柄来自上面的 OpenFileById，只在这里关闭一次。
+                unsafe {
+                    let _ = CloseHandle(self.0);
+                }
+            }
+        }
+        let h = Guard(h);
+
+        let mut std_info = FILE_STANDARD_INFO::default();
+        let mut basic = FILE_BASIC_INFO::default();
+        // SAFETY: 两个输出结构都是可写的，长度与传入一致。
+        let size = unsafe {
+            GetFileInformationByHandleEx(
+                h.0,
+                FileStandardInfo,
+                (&mut std_info as *mut FILE_STANDARD_INFO).cast(),
+                std::mem::size_of::<FILE_STANDARD_INFO>() as u32,
+            )
+        }
+        .ok()
+        .and_then(|()| (!std_info.Directory).then(|| u64::try_from(std_info.EndOfFile).ok()).flatten());
+        // SAFETY: 同上。
+        let modified = unsafe {
+            GetFileInformationByHandleEx(
+                h.0,
+                FileBasicInfo,
+                (&mut basic as *mut FILE_BASIC_INFO).cast(),
+                std::mem::size_of::<FILE_BASIC_INFO>() as u32,
+            )
+        }
+        .ok()
+        .map(|()| crate::parse::filetime_to_unix(basic.LastWriteTime));
+        Some((size, modified))
+    }
 }
 
 impl NtfsVolume {

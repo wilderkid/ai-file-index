@@ -330,19 +330,37 @@ impl VolumeIndex {
         Some(out)
     }
 
+    /// 用数据源查到的真实值更新一个节点的大小与修改时间。`None` 的字段保持不变。
+    pub fn set_metadata(&mut self, r: FileRef, size: Option<u64>, modified: Option<i64>) {
+        if let Some(id) = self.lookup(r) {
+            let n = self.node_mut(id);
+            if let Some(s) = size.filter(|_| !n.is_dir()) {
+                n.size = s;
+            }
+            if let Some(t) = modified {
+                n.modified = t;
+            }
+        }
+    }
+
     /// 应用一条 USN 增量变更。
     pub fn apply(&mut self, ev: &ChangeEvent) -> Result<()> {
         match ev.kind {
             ChangeKind::Created | ChangeKind::Renamed => {
-                let id = self.insert(&FileRecord {
+                // 重命名不改内容：沿用已知大小。修改时间取事件时间（NTFS 的 LastWriteTime 不随改名变化，
+                // 但事件时间更接近"最近动过"，后续 `set_metadata` 会用真实值覆盖）。
+                let size = match ev.kind {
+                    ChangeKind::Renamed => self.lookup(ev.file_ref).and_then(|id| self.node(id).size()),
+                    _ => None,
+                };
+                self.insert(&FileRecord {
                     file_ref: ev.file_ref,
                     parent: ev.parent,
                     name: ev.name.clone(),
                     is_dir: ev.is_dir,
-                    size: None,
-                    modified: Some(ev.timestamp), // 经 insert 转成节点内的哨兵表示
+                    size,
+                    modified: Some(ev.timestamp),
                 })?;
-                let _ = id;
             }
             ChangeKind::Deleted => {
                 if let Some(id) = self.by_ref.remove(&ev.file_ref) {
@@ -463,6 +481,33 @@ mod tests {
         })
         .unwrap();
         assert_eq!(v.children(dir).collect::<Vec<_>>(), vec![f2]);
+    }
+
+    #[test]
+    fn rename_keeps_size_and_set_metadata_updates_it() {
+        let mut v = vol();
+        v.insert(&rec(10, 5, "a", true)).unwrap();
+        let f = v.insert(&FileRecord { size: Some(42), ..rec(30, 10, "x.txt", false) }).unwrap();
+        let ev = |kind, name: &str| ChangeEvent {
+            usn: 1,
+            kind,
+            file_ref: FileRef(30),
+            parent: FileRef(10),
+            name: name.into(),
+            is_dir: false,
+            timestamp: 7,
+        };
+        v.apply(&ev(ChangeKind::Renamed, "y.txt")).unwrap();
+        assert_eq!(v.node(f).size(), Some(42), "改名不改大小");
+        assert_eq!(v.node(f).modified(), Some(7));
+
+        v.set_metadata(FileRef(30), Some(100), None);
+        assert_eq!((v.node(f).size(), v.node(f).modified()), (Some(100), Some(7)));
+        v.set_metadata(FileRef(999), Some(1), Some(1)); // 不存在的 FRN：无事发生
+
+        let dir = v.lookup(FileRef(10)).unwrap();
+        v.set_metadata(FileRef(10), Some(5), Some(9));
+        assert_eq!(v.node(dir).size(), None, "目录不记大小");
     }
 
     #[test]

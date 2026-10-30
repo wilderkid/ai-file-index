@@ -29,7 +29,9 @@ use crate::types::{FileRef, JournalCursor, VolumeInfo};
 use crate::{Error, Result};
 
 const MAGIC: &[u8; 8] = b"AIFI_SNP";
-const FORMAT_VERSION: u32 = 1;
+/// 2：节点开始带大小与修改时间（M10）。布局与 1 相同，但 1 的快照里大小全是"未知"，
+/// 继续加载会让大小过滤永远查不到它们，所以升版本强制重建一次。
+const FORMAT_VERSION: u32 = 2;
 /// 固定头部长度。将来追加字段时增大它，旧读取器据此跳过未知部分。
 const HEADER_LEN: usize = 8 + 4 + 4 + 8 + 8 + 8 + 4 + 4 + 8;
 /// 单个节点的编码长度：两个 FRN + 名字偏移/长度 + 标志 + 大小 + 时间 + 项目 id。

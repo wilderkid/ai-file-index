@@ -1,7 +1,7 @@
 //! 数据源与快照的抽象接口。
 
 use crate::index::VolumeIndex;
-use crate::types::{ChangeEvent, FileRecord, JournalCursor, VolumeInfo};
+use crate::types::{ChangeEvent, FileRecord, FileRef, JournalCursor, VolumeInfo};
 use crate::{Error, Result};
 
 /// 一个卷的数据来源。
@@ -25,6 +25,17 @@ pub trait VolumeSource {
     /// 若日志被截断或 Journal ID 变化，必须返回 [`crate::Error::JournalReset`]，
     /// 由上层触发整卷重建。
     fn read_changes(&mut self, from: JournalCursor, sink: &mut dyn FnMut(ChangeEvent)) -> Result<JournalCursor>;
+
+    /// 全量枚举，并尽量带上大小与修改时间。默认等同 [`Self::enumerate`]。
+    fn enumerate_with_metadata(&mut self, sink: &mut dyn FnMut(FileRecord)) -> Result<JournalCursor> {
+        self.enumerate(sink)
+    }
+
+    /// 按 FRN 查询一个文件当前的 `(大小, 修改时间)`，用于增量后补全元数据（USN 记录不含大小）。
+    /// 文件已不存在、无权访问或数据源不支持时返回 `None`。只读，不得打开文件内容。
+    fn metadata(&mut self, _file: FileRef) -> Option<(Option<u64>, Option<i64>)> {
+        None
+    }
 }
 
 /// 快照持久化（M3：rkyv + memmap2，带格式版本号与每卷 JournalCursor）。
@@ -44,7 +55,7 @@ pub fn build_index<S: VolumeSource + ?Sized>(src: &mut S) -> Result<(VolumeIndex
     let info = src.info()?;
     let mut idx = VolumeIndex::new(info);
     let mut err = None;
-    let cursor = src.enumerate(&mut |rec| {
+    let cursor = src.enumerate_with_metadata(&mut |rec| {
         if err.is_none() {
             if let Err(e) = idx.insert(&rec) {
                 err = Some(e);

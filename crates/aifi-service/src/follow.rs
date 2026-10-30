@@ -5,7 +5,7 @@
 
 use std::sync::{Mutex, RwLock};
 
-use aifi_core::{ChangeEvent, ChangeKind, Error, StartKind, VolumeSource, build_index};
+use aifi_core::{ChangeEvent, ChangeKind, Error, FileRef, StartKind, VolumeSource, build_index};
 use aifi_project::Denylist;
 use aifi_protocol::{ChangeEntry, ChangeType};
 
@@ -61,11 +61,45 @@ pub fn poll_volume<S: VolumeSource + ?Sized>(
         }
     }
 
+    refresh_metadata(src, slot, &events);
+
     let mut log = lock(recent);
     for e in entries {
         log.push(e, deny);
     }
     Ok(PollOutcome::Applied(events.len()))
+}
+
+/// 一批里最多补查这么多个文件的元数据。正常写入每秒几十个文件；大批量解压、编译时
+/// 超出的部分保持事件时间、大小未知，等下次全量或下一次修改再补，不让一批查询拖住轮询。
+const METADATA_PER_BATCH: usize = 512;
+
+/// USN 记录不带大小。对新建和修改过的文件按 FRN 查一次当前大小与修改时间（锁外 IO），
+/// 再在短暂的写锁里写回。
+fn refresh_metadata<S: VolumeSource + ?Sized>(src: &mut S, slot: &RwLock<VolumeSlot>, events: &[ChangeEvent]) {
+    let mut wanted: Vec<FileRef> = events
+        .iter()
+        .filter(|e| !e.is_dir && matches!(e.kind, ChangeKind::Created | ChangeKind::Modified))
+        .map(|e| e.file_ref)
+        .collect();
+    // 同一文件在一批里常有多条修改；只查一次。删除过的不查。
+    wanted.sort_unstable_by_key(|r| r.0);
+    wanted.dedup();
+    let deleted: std::collections::HashSet<FileRef> =
+        events.iter().filter(|e| e.kind == ChangeKind::Deleted).map(|e| e.file_ref).collect();
+    let found: Vec<_> = wanted
+        .into_iter()
+        .filter(|r| !deleted.contains(r))
+        .take(METADATA_PER_BATCH)
+        .filter_map(|r| src.metadata(r).map(|m| (r, m)))
+        .collect();
+    if found.is_empty() {
+        return;
+    }
+    let mut s = write(slot);
+    for (r, (size, modified)) in found {
+        s.index.set_metadata(r, size, modified);
+    }
 }
 
 /// 锁外全量枚举，完成后替换索引。重建期间旧索引继续服务查询。
@@ -152,6 +186,32 @@ mod tests {
         );
 
         assert_eq!(poll_volume(&mut vol, &slot, &recent, &deny).unwrap(), PollOutcome::Applied(0));
+    }
+
+    #[test]
+    fn created_and_written_files_get_their_size() {
+        let deny = Denylist::with_defaults();
+        let mut vol = FakeVolume::new("C:");
+        vol.add_path(r"data\");
+        let (slot, recent) = setup(&mut vol);
+
+        vol.create_path(r"data\big.bin");
+        vol.write(r"data\big.bin", 5_000_000_000);
+        vol.create_path(r"data\gone.bin");
+        vol.delete(r"data\gone.bin");
+        poll_volume(&mut vol, &slot, &recent, &deny).unwrap();
+
+        let s = read(&slot);
+        let id = s.index.lookup_path(r"C:\data\big.bin").unwrap();
+        assert_eq!(s.index.node(id).size(), Some(5_000_000_000));
+        assert!(s.index.lookup_path(r"C:\data\gone.bin").is_none());
+        drop(s);
+
+        vol.rename(r"data\big.bin", r"data\renamed.bin");
+        poll_volume(&mut vol, &slot, &recent, &deny).unwrap();
+        let s = read(&slot);
+        let id = s.index.lookup_path(r"C:\data\renamed.bin").unwrap();
+        assert_eq!(s.index.node(id).size(), Some(5_000_000_000), "改名后大小保留");
     }
 
     #[test]

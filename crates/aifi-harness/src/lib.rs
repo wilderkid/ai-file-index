@@ -211,6 +211,17 @@ impl FakeVolume {
         self.log(ChangeKind::Modified, r);
     }
 
+    /// 改写文件内容为 `size` 字节：更新大小与修改时间并写一条修改记录。
+    pub fn write(&mut self, path: &str, size: u64) {
+        let r = self.lookup(path).expect("write target exists");
+        self.clock += 1;
+        let now = self.clock;
+        let rec = self.files.get_mut(&r).expect("write target record");
+        rec.size = Some(size);
+        rec.modified = Some(now);
+        self.log(ChangeKind::Modified, r);
+    }
+
     /// 模拟日志被截断：丢弃 `keep_last` 之前的所有记录。
     pub fn truncate_journal(&mut self, keep_last: usize) {
         let drop = self.journal.len().saturating_sub(keep_last);
@@ -284,5 +295,9 @@ impl VolumeSource for FakeVolume {
             sink(ev.clone());
         }
         Ok(JournalCursor { journal_id: self.journal_id, next_usn: self.next_usn() })
+    }
+
+    fn metadata(&mut self, file: FileRef) -> Option<(Option<u64>, Option<i64>)> {
+        self.files.get(&file).map(|f| (f.size, f.modified))
     }
 }
