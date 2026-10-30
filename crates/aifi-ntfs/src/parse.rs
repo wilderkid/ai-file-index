@@ -18,6 +18,8 @@ pub struct RawUsnRecord {
     pub usn: i64,
     pub reason: u32,
     pub attributes: u32,
+    /// 记录时间（`TimeStamp`，已从 FILETIME 转成 Unix 秒）。
+    pub timestamp: i64,
     /// 文件名，UTF-8。非法 UTF-16 用 U+FFFD 替换。
     pub name: String,
     /// 主版本号：2 或 3。
@@ -42,8 +44,15 @@ pub fn to_change_event(r: &RawUsnRecord) -> Option<ChangeEvent> {
         parent: FileRef(r.parent),
         name: r.name.clone(),
         is_dir: r.attributes & 0x10 != 0,
-        timestamp: r.usn,
+        timestamp: r.timestamp,
     })
+}
+
+/// FILETIME（1601-01-01 起的 100 ns 计数）转 Unix 秒。
+pub fn filetime_to_unix(ft: i64) -> i64 {
+    /// 1601-01-01 到 1970-01-01 的秒数。
+    const EPOCH_DIFF: i64 = 11_644_473_600;
+    ft.div_euclid(10_000_000) - EPOCH_DIFF
 }
 
 /// 解析 `FSCTL_ENUM_USN_DATA` 输出缓冲区中、起始 FRN 之后的记录区。
@@ -107,6 +116,8 @@ fn parse_one(buf: &[u8]) -> Result<(RawUsnRecord, usize)> {
         return Err(Error::new(ErrorKind::InvalidData, "USN record shorter than its fixed header"));
     }
     let usn = i64::from_le_bytes(buf[usn_at..usn_at + 8].try_into().unwrap());
+    // TimeStamp 紧跟在 Usn 之后。
+    let timestamp = filetime_to_unix(i64::from_le_bytes(buf[usn_at + 8..usn_at + 16].try_into().unwrap()));
     let reason = u32::from_le_bytes(buf[reason_at..reason_at + 4].try_into().unwrap());
     let attributes = u32::from_le_bytes(buf[reason_at + 12..reason_at + 16].try_into().unwrap());
     let name_len = u16::from_le_bytes(buf[fixed - 4..fixed - 2].try_into().unwrap()) as usize;
@@ -117,7 +128,7 @@ fn parse_one(buf: &[u8]) -> Result<(RawUsnRecord, usize)> {
     }
     let name = decode_utf16(&buf[name_off..name_off + name_len]);
 
-    Ok((RawUsnRecord { frn, parent, usn, reason, attributes, name, version }, record_len))
+    Ok((RawUsnRecord { frn, parent, usn, reason, attributes, timestamp, name, version }, record_len))
 }
 
 fn read_u64(b: &[u8]) -> u64 {
@@ -134,6 +145,16 @@ fn decode_utf16(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    /// 2023-11-14 22:13:20 UTC（Unix 1_700_000_000）的 FILETIME。
+    const FT_2023: i64 = (1_700_000_000 + 11_644_473_600) * 10_000_000;
+
+    #[test]
+    fn filetime_converts_to_unix_seconds() {
+        assert_eq!(filetime_to_unix(FT_2023), 1_700_000_000);
+        assert_eq!(filetime_to_unix(FT_2023 + 9_999_999), 1_700_000_000);
+        assert_eq!(filetime_to_unix(0), -11_644_473_600);
+    }
+
     /// 构造一条 V2 记录。`name` 为 UTF-16 码元。
     fn v2(frn: u64, parent: u64, usn: i64, reason: u32, name: &[u16]) -> Vec<u8> {
         let name_bytes = name.len() * 2;
@@ -144,6 +165,7 @@ mod tests {
         b[8..16].copy_from_slice(&frn.to_le_bytes());
         b[16..24].copy_from_slice(&parent.to_le_bytes());
         b[24..32].copy_from_slice(&usn.to_le_bytes());
+        b[32..40].copy_from_slice(&FT_2023.to_le_bytes());
         b[40..44].copy_from_slice(&reason.to_le_bytes());
         b[56..58].copy_from_slice(&(name_bytes as u16).to_le_bytes());
         b[58..60].copy_from_slice(&(V2_FIXED as u16).to_le_bytes());
@@ -161,6 +183,7 @@ mod tests {
         b[4..6].copy_from_slice(&3u16.to_le_bytes());
         b[8..16].copy_from_slice(&frn_low.to_le_bytes());
         b[24..32].copy_from_slice(&parent_low.to_le_bytes());
+        b[48..56].copy_from_slice(&FT_2023.to_le_bytes());
         b[72..74].copy_from_slice(&(name_bytes as u16).to_le_bytes());
         b[74..76].copy_from_slice(&(V3_FIXED as u16).to_le_bytes());
         for (i, u) in name.iter().enumerate() {
@@ -177,6 +200,7 @@ mod tests {
             usn: 500,
             reason: crate::reason::FILE_CREATE | crate::reason::CLOSE,
             attributes: 0x10,
+            timestamp: 1_700_000_000,
             name: "docs".into(),
             version: 2,
         };
@@ -184,6 +208,7 @@ mod tests {
         assert_eq!(ev.kind, ChangeKind::Created);
         assert!(ev.is_dir);
         assert_eq!(ev.file_ref, FileRef(30));
+        assert_eq!(ev.timestamp, 1_700_000_000, "时间戳来自记录，不是 USN");
 
         rec.reason = crate::reason::RENAME_OLD_NAME;
         assert!(to_change_event(&rec).is_none(), "只有旧名的记录应被忽略");
@@ -202,6 +227,8 @@ mod tests {
         assert_eq!(recs[0].parent, 10);
         assert_eq!(recs[0].name, "季度报告.xlsx");
         assert_eq!(recs[0].version, 2);
+        assert_eq!(recs[0].usn, 1000);
+        assert_eq!(recs[0].timestamp, 1_700_000_000);
     }
 
     #[test]
@@ -212,6 +239,7 @@ mod tests {
         assert_eq!(rec.frn, 0xABCD);
         assert_eq!(rec.parent, 5);
         assert_eq!(rec.name, "a.rs");
+        assert_eq!(rec.timestamp, 1_700_000_000);
     }
 
     #[test]
