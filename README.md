@@ -3,7 +3,7 @@
 > 给 AI 编程助手（Claude Code、Codex 等）用的 **Windows 本地文件名索引服务**：
 > 像 Listary / Everything 一样毫秒级找文件，支持**拼音 / 首字母**，按**项目**理解目录结构，通过 **MCP** 暴露给 AI。
 
-⚠️ **状态：骨架阶段（pre-alpha）**。接口、协议和测试框架已就位，大部分实现是带文档的 `todo!()`，按 `docs/tasks/M1..M7` 逐步完成。
+**状态：alpha**。整盘文件名索引、拼音匹配、项目识别、USN 实时增量（< 1 s）、快照冷启动（< 1 s）、Windows 服务与 MSI 已可用。尚未实现：文件大小 / 修改时间与按目录、时间过滤（M10），内容搜索（M11）。路线见 `docs/tasks/`。
 
 ## 为什么
 
@@ -56,7 +56,9 @@ cargo check --workspace --target x86_64-pc-windows-gnu
 
 参与开发（尤其是用 AI 写代码）请先读 [AGENTS.md](AGENTS.md)，任务卡在 [docs/tasks/](docs/tasks/)。
 
-## 接入 AI 助手（M7 完成后可用）
+## 安装与接入
+
+安装 MSI（构建方法见 [installer/README.md](installer/README.md)），然后：
 
 ```powershell
 claude mcp add --scope user --transport stdio ai-file-index -- "C:\Program Files\AiFileIndex\aifi-mcp.exe"
@@ -70,6 +72,8 @@ codex mcp add ai-file-index -- "C:\Program Files\AiFileIndex\aifi-mcp.exe"
 command = 'C:\Program Files\AiFileIndex\aifi-mcp.exe'
 args = []
 ```
+
+排错与控制台调试模式见 [docs/setup.md](docs/setup.md)。
 
 ## 隐私
 
@@ -85,4 +89,4 @@ args = []
 
 **ai-file-index** is a local, read-only Windows file-name index for AI coding assistants. A privileged Windows service builds an in-memory index of all NTFS volumes from the MFT/USN journal; an unprivileged MCP server (`aifi-mcp`, stdio) exposes `find_files`, `list_project_tree`, `list_projects`, `recent_changes` and `index_status` to Claude Code, Codex and other MCP clients. Features: millisecond name search, Chinese pinyin / initials matching, project awareness (.gitignore, default excludes), a non-overridable privacy denylist, no telemetry, no network.
 
-Status: **skeleton**. Pure-logic crates build and test on any OS (`cargo test`); Windows-only parts are `cfg(windows)` and mostly `todo!()`. Work is split into tickets `docs/tasks/M1..M7` (written in Chinese). Proposed license: MIT OR Apache-2.0.
+Status: **alpha**. Whole-disk name index, pinyin matching, project awareness, live USN updates (< 1 s), snapshot cold start (< 1 s), Windows service and MSI work. Not yet: size/mtime metadata and filters (M10), content search (M11). Tickets in `docs/tasks/` (written in Chinese). Proposed license: MIT OR Apache-2.0.

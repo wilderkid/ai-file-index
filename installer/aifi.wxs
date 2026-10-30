@@ -1,21 +1,65 @@
-<!-- M7 占位：WiX v5 安装包骨架，尚不可构建。GUID 与版本号需在实现时填写。 -->
-<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
-  <Package Name="AI File Index" Manufacturer="ai-file-index contributors"
-           Version="0.1.0" UpgradeCode="PUT-GUID-HERE" Scope="perMachine">
-    <MajorUpgrade DowngradeErrorMessage="A newer version is already installed." />
+<!--
+  WiX v5 安装包。构建步骤见 installer/README.md。
+  预处理变量：Version（默认 0.1.0）、BinDir（默认 ..\target\release，相对本文件）。
+
+  只用 WiX 内建元素，不执行任何自定义脚本动作。安装/卸载只在一次性虚拟机中测试。
+  UpgradeCode 一经发布不能再改，否则升级会变成并存安装。
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs" xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
+  <?ifndef Version?>
+  <?define Version = "0.1.0"?>
+  <?endif?>
+  <?ifndef BinDir?>
+  <?define BinDir = "..\target\release"?>
+  <?endif?>
+  <Package Name="AI File Index" Manufacturer="ai-file-index contributors" Version="$(Version)"
+           UpgradeCode="DAE0D45A-F592-4840-8346-4731E225D305" Scope="perMachine" Compressed="yes">
+    <MajorUpgrade DowngradeErrorMessage="A newer version of AI File Index is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
     <StandardDirectory Id="ProgramFiles64Folder">
       <Directory Id="INSTALLFOLDER" Name="AiFileIndex">
-        <Component Id="Service">
-          <File Source="..\target\release\aifi-service.exe" KeyPath="yes" />
+        <Component Id="Service" Bitness="always64">
+          <File Id="ServiceExe" Source="$(BinDir)\aifi-service.exe" KeyPath="yes" />
           <ServiceInstall Name="AiFileIndex" DisplayName="AI File Index"
-                          Description="Local read-only file name index for AI assistants"
-                          Type="ownProcess" Start="auto" ErrorControl="normal" Account="LocalSystem" />
-          <ServiceControl Id="SvcCtl" Name="AiFileIndex" Start="install" Stop="both" Remove="uninstall" Wait="yes" />
+                          Description="Local read-only file name index for AI assistants (no network)."
+                          Type="ownProcess" Start="auto" ErrorControl="normal" Account="LocalSystem" Vital="yes">
+            <!-- 延迟自启：开机时不和其他服务抢磁盘。Util 扩展不支持这一项，只能用内建元素（WIX1149 警告）。 -->
+            <ServiceConfig DelayedAutoStart="yes" OnInstall="yes" OnReinstall="yes" />
+            <!-- 崩溃后由 SCM 重启：前三次失败各在 5 s 后重启，一天后计数清零。只覆盖进程崩溃；以非 0 退出码正常停止不触发（需 sc failureflag，WiX 不支持）。
+                 用 WiX Util 扩展自带的原生自定义动作（不是脚本）：内建的 ServiceConfigFailureActions 被 SDK 记载为不可靠。 -->
+            <util:ServiceConfig FirstFailureActionType="restart" SecondFailureActionType="restart"
+                                ThirdFailureActionType="restart" RestartServiceDelayInSeconds="5"
+                                ResetPeriodInDays="1" />
+          </ServiceInstall>
+          <ServiceControl Id="ServiceControl" Name="AiFileIndex" Start="install" Stop="both" Remove="uninstall"
+                          Wait="yes" />
         </Component>
-        <Component Id="Mcp">
-          <File Source="..\target\release\aifi-mcp.exe" KeyPath="yes" />
+        <Component Id="Mcp" Bitness="always64">
+          <!-- 升级时若被 AI 会话占用，Windows Installer 会提示关闭占用进程或重启后替换；不自动结束进程。 -->
+          <File Id="McpExe" Source="$(BinDir)\aifi-mcp.exe" KeyPath="yes" />
         </Component>
       </Directory>
     </StandardDirectory>
+
+    <!-- 快照目录：含全部文件名（包括黑名单内的），只允许 SYSTEM 与 Administrators。
+         服务首次运行时若目录不存在也会用同样的 ACL 创建。卸载时删除整个目录。 -->
+    <StandardDirectory Id="CommonAppDataFolder">
+      <Directory Id="DATAFOLDER" Name="AiFileIndex">
+        <Component Id="DataFolder" Guid="5B4D8E2C-7F0A-4C61-9B3E-2A6D1F9C8E47">
+          <CreateFolder>
+            <PermissionEx Sddl="D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)" />
+          </CreateFolder>
+          <RemoveFile Id="RemoveSnapshots" Name="*" On="uninstall" />
+          <RemoveFolder Id="RemoveDataFolder" On="uninstall" />
+        </Component>
+      </Directory>
+    </StandardDirectory>
+
+    <Feature Id="Main" Title="AI File Index">
+      <ComponentRef Id="Service" />
+      <ComponentRef Id="Mcp" />
+      <ComponentRef Id="DataFolder" />
+    </Feature>
   </Package>
 </Wix>
