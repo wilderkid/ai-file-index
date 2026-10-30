@@ -21,9 +21,9 @@ tracing-subscriber.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 aifi-ntfs.workspace = true
-windows = { workspace = true, features = ["Win32_Security", "Win32_Security_Authorization", "Win32_Foundation"] }
+windows = { workspace = true, features = ["Win32_Security", "Win32_Security_Authorization", "Win32_Foundation", "Win32_Storage_FileSystem"] }
 windows-service.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["signal"] }
 
 [dev-dependencies]
 aifi-harness.workspace = true

@@ -76,6 +76,11 @@ impl NtfsVolume {
     }
 }
 
+// SAFETY: 内核对象句柄可以在任意线程使用，`HANDLE` 不是 `Send` 只是因为它包着裸指针。
+// `NtfsVolume` 独占句柄（不 Clone、不外泄），`&mut self` 方法保证同一时刻只有一个线程发 IOCTL。
+// 不实现 `Sync`。
+unsafe impl Send for NtfsVolume {}
+
 impl Drop for NtfsVolume {
     fn drop(&mut self) {
         // SAFETY: `handle` 来自 `CreateFileW` 且只关闭一次；`Drop` 是唯一的关闭点。

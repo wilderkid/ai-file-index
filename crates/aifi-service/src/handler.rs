@@ -1,30 +1,37 @@
-//! 请求分发（与传输无关）。M6 实现；保持纯逻辑以便在 Linux 上做单元测试。
+//! 请求分发（与传输无关）。保持纯逻辑以便在 Linux 上做单元测试。
 
 use aifi_core::VolumeIndex;
 use aifi_project::{Denylist, ProjectRegistry};
 use aifi_protocol::{Capability, ErrorCode, PROTOCOL_VERSION, Request, Response};
 
+use crate::state::VolumeSlot;
+
 /// 服务端请求处理器，持有全部卷索引与项目信息。
 ///
-/// 索引以共享引用持有：服务层用 `RwLock` 包一层再传入，本结构本身不含锁，
-/// 因此可以在没有运行时的情况下用假卷测试。
-#[allow(dead_code)] // 由尚未实现的服务入口构造。
+/// 卷槽位以共享引用持有：[`crate::state::ServiceState::handle`] 取好读锁再传入，
+/// 本结构本身不含锁，因此可以在没有运行时的情况下用假卷测试。
 pub struct Handler<'a> {
-    volumes: &'a [VolumeIndex],
+    volumes: &'a [&'a VolumeSlot],
     projects: &'a ProjectRegistry,
     denylist: &'a Denylist,
     recent: Option<&'a crate::recent::RecentLog>,
+    snapshot_age: Option<u64>,
 }
 
-#[allow(dead_code)]
 impl<'a> Handler<'a> {
     /// 当前实现的能力。内容搜索（`Content`）在 v2 之前不得出现在这里。
     pub fn capabilities() -> Vec<Capability> {
         vec![Capability::Names, Capability::Pinyin]
     }
 
-    pub fn new(volumes: &'a [VolumeIndex], projects: &'a ProjectRegistry, denylist: &'a Denylist) -> Self {
-        Self { volumes, projects, denylist, recent: None }
+    pub fn new(volumes: &'a [&'a VolumeSlot], projects: &'a ProjectRegistry, denylist: &'a Denylist) -> Self {
+        Self { volumes, projects, denylist, recent: None, snapshot_age: None }
+    }
+
+    /// 最近一次快照距今的秒数，由 `index_status` 报告。
+    pub fn with_snapshot_age(mut self, age: Option<u64>) -> Self {
+        self.snapshot_age = age;
+        self
     }
 
     /// 附带最近变更记录。服务层在持有 `RecentLog` 时用这个构造。
@@ -81,7 +88,7 @@ impl<'a> Handler<'a> {
         };
         let ctx = QueryContext { denylist: self.denylist, tier: &tier, max_tier, gitignored: None };
         let limit = clamp_limit(p.limit) as usize;
-        let refs: Vec<&VolumeIndex> = self.volumes.iter().collect();
+        let refs: Vec<&VolumeIndex> = self.volumes.iter().map(|s| &s.index).collect();
         tracing::info!("searching {} volumes, query {:?}", refs.len(), q.spec().text);
         let page = search(&refs, &q, &ctx, limit, p.cursor.as_deref());
 
@@ -163,7 +170,25 @@ impl<'a> Handler<'a> {
             };
         };
         let limit = aifi_protocol::clamp_limit(p.limit) as usize;
-        let (changes, truncated) = log.recent(p.since, limit);
+        // 缺省只看最近 24 小时，与工具说明一致。
+        let since = p.since.or_else(|| {
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok()?;
+            Some(now.as_secs() as i64 - 24 * 3600)
+        });
+        // 项目范围：只要 cwd 所在项目内的变更；cwd 不在项目里时退回全部。
+        let root = match p.scope {
+            aifi_protocol::Scope::Project => {
+                p.cwd.as_deref().and_then(|c| self.projects.resolve(c)).map(|proj| proj.root.as_str())
+            }
+            _ => None,
+        };
+        let roots = self.projects.roots();
+        let keep = |path: &str| match (p.scope, root) {
+            (aifi_protocol::Scope::Project, Some(r)) => aifi_project::is_within(path, r),
+            (aifi_protocol::Scope::AllProjects, _) => roots.iter().any(|r| aifi_project::is_within(path, r)),
+            _ => true,
+        };
+        let (changes, truncated) = log.recent(since, limit, keep);
         Response::RecentChanges(aifi_protocol::RecentChangesResult { changes, truncated })
     }
 
@@ -171,29 +196,32 @@ impl<'a> Handler<'a> {
         let volumes = self
             .volumes
             .iter()
-            .map(|v| aifi_protocol::VolumeStatus {
-                mount: v.info().mount.clone(),
+            .map(|s| aifi_protocol::VolumeStatus {
+                mount: s.index.info().mount.clone(),
                 fs: "ntfs".into(),
-                entries: v.live_count() as u64,
-                state: "ready".into(),
-                last_usn: None,
-                error: None,
+                entries: s.index.live_count() as u64,
+                state: s.state.as_str().into(),
+                last_usn: Some(s.cursor.next_usn),
+                error: match &s.state {
+                    crate::state::VolState::Error(e) => Some(e.clone()),
+                    _ => None,
+                },
             })
             .collect();
-        let memory: u64 = self.volumes.iter().map(|v| v.memory_usage().total_bytes() as u64).sum();
+        let memory: u64 = self.volumes.iter().map(|s| s.index.memory_usage().total_bytes() as u64).sum();
         Response::IndexStatus(aifi_protocol::IndexStatusResult {
             service_version: env!("CARGO_PKG_VERSION").into(),
             protocol_version: PROTOCOL_VERSION,
             capabilities: Self::capabilities(),
             volumes,
             memory_bytes: memory,
-            snapshot_age_secs: None,
+            snapshot_age_secs: self.snapshot_age,
         })
     }
 
     /// 在所有卷里按完整路径找一个节点。走路径索引，不扫全表。
     fn locate(&self, path: &str) -> Option<(&'a VolumeIndex, aifi_core::NodeId)> {
-        self.volumes.iter().find_map(|idx| idx.lookup_path(path).map(|id| (idx, id)))
+        self.volumes.iter().find_map(|s| s.index.lookup_path(path).map(|id| (&s.index, id)))
     }
 }
 
@@ -216,19 +244,20 @@ mod tests {
         }
     }
 
-    fn setup() -> (aifi_core::VolumeIndex, ProjectRegistry, Denylist) {
+    fn setup() -> (VolumeSlot, ProjectRegistry, Denylist) {
         use aifi_core::build_index;
         use aifi_harness::fixtures;
         let mut vol = fixtures::dev_machine();
-        let (idx, _) = build_index(&mut vol).unwrap();
+        let (idx, cursor) = build_index(&mut vol).unwrap();
         let projects = ProjectRegistry::discover(&idx);
-        (idx, projects, Denylist::with_defaults())
+        (VolumeSlot::new(idx, cursor, aifi_core::StartKind::FullRebuild), projects, Denylist::with_defaults())
     }
 
     #[test]
     fn find_files_returns_hits_and_hides_secrets() {
-        let (idx, projects, deny) = setup();
-        let h = Handler::new(std::slice::from_ref(&idx), &projects, &deny);
+        let (slot, projects, deny) = setup();
+        let slots = [&slot];
+        let h = Handler::new(&slots, &projects, &deny);
         match h.handle(Request::FindFiles(aifi_protocol::FindFilesParams {
             query: "main.rs".into(),
             ..Default::default()
@@ -251,8 +280,9 @@ mod tests {
 
     #[test]
     fn empty_query_is_invalid_params() {
-        let (idx, projects, deny) = setup();
-        let h = Handler::new(std::slice::from_ref(&idx), &projects, &deny);
+        let (slot, projects, deny) = setup();
+        let slots = [&slot];
+        let h = Handler::new(&slots, &projects, &deny);
         match h.handle(Request::FindFiles(aifi_protocol::FindFilesParams { query: "  ".into(), ..Default::default() }))
         {
             Response::Error { code, .. } => assert_eq!(code, ErrorCode::InvalidParams),
@@ -262,8 +292,9 @@ mod tests {
 
     #[test]
     fn list_projects_and_tree() {
-        let (idx, projects, deny) = setup();
-        let h = Handler::new(std::slice::from_ref(&idx), &projects, &deny);
+        let (slot, projects, deny) = setup();
+        let slots = [&slot];
+        let h = Handler::new(&slots, &projects, &deny);
         let roots = match h.handle(Request::ListProjects(aifi_protocol::ListProjectsParams::default())) {
             Response::Projects(r) => r.projects,
             r => panic!("{r:?}"),
@@ -285,8 +316,9 @@ mod tests {
 
     #[test]
     fn tree_lists_a_directory_that_is_not_a_project() {
-        let (idx, projects, deny) = setup();
-        let h = Handler::new(std::slice::from_ref(&idx), &projects, &deny);
+        let (slot, projects, deny) = setup();
+        let slots = [&slot];
+        let h = Handler::new(&slots, &projects, &deny);
         match h.handle(Request::ListProjectTree(aifi_protocol::ListProjectTreeParams {
             path: Some(r"C:\Users\me\Documents".into()),
             max_depth: Some(1),
@@ -309,8 +341,9 @@ mod tests {
 
     #[test]
     fn index_status_reports_volume() {
-        let (idx, projects, deny) = setup();
-        let h = Handler::new(std::slice::from_ref(&idx), &projects, &deny);
+        let (slot, projects, deny) = setup();
+        let slots = [&slot];
+        let h = Handler::new(&slots, &projects, &deny);
         match h.handle(Request::IndexStatus(aifi_protocol::IndexStatusParams {})) {
             Response::IndexStatus(s) => {
                 assert_eq!(s.volumes.len(), 1);
@@ -323,8 +356,9 @@ mod tests {
 
     #[test]
     fn recent_changes_not_ready_without_a_log() {
-        let (idx, projects, deny) = setup();
-        let h = Handler::new(std::slice::from_ref(&idx), &projects, &deny);
+        let (slot, projects, deny) = setup();
+        let slots = [&slot];
+        let h = Handler::new(&slots, &projects, &deny);
         match h.handle(Request::RecentChanges(aifi_protocol::RecentChangesParams::default())) {
             Response::Error { code, .. } => assert_eq!(code, ErrorCode::NotReady),
             r => panic!("{r:?}"),

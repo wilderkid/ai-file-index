@@ -9,11 +9,9 @@ use aifi_protocol::ChangeEntry;
 use aifi_protocol::ChangeType;
 
 /// 默认每卷保留的条数。
-#[allow(dead_code)]
 pub const DEFAULT_CAPACITY: usize = 10_000;
 
 /// 最近变更记录。由服务入口在 USN 线程里写入。
-#[allow(dead_code)]
 #[derive(Debug)]
 pub struct RecentLog {
     entries: Vec<ChangeEntry>,
@@ -22,16 +20,18 @@ pub struct RecentLog {
     len: usize,
 }
 
-#[allow(dead_code)]
 impl RecentLog {
     pub fn new(cap: usize) -> Self {
         Self { entries: Vec::with_capacity(cap.min(1024)), cap, next: 0, len: 0 }
     }
 
-    /// 记录一条变更。命中黑名单的路径直接丢弃。
-    pub fn push(&mut self, entry: ChangeEntry, deny: &Denylist) {
-        if deny.is_denied(&entry.path) {
+    /// 记录一条变更。命中黑名单的路径直接丢弃；旧路径命中黑名单时只去掉旧路径。
+    pub fn push(&mut self, mut entry: ChangeEntry, deny: &Denylist) {
+        if self.cap == 0 || deny.is_denied(&entry.path) {
             return;
+        }
+        if entry.old_path.as_deref().is_some_and(|p| deny.is_denied(p)) {
+            entry.old_path = None;
         }
         if self.entries.len() < self.cap {
             self.entries.push(entry);
@@ -42,15 +42,15 @@ impl RecentLog {
         self.len = self.len.min(self.cap - 1) + 1;
     }
 
-    /// 取最近的变更，新的在前。`since` 为 Unix 秒，只返回该时间之后的。
-    pub fn recent(&self, since: Option<i64>, limit: usize) -> (Vec<ChangeEntry>, bool) {
+    /// 取最近的变更，新的在前。`since` 为 Unix 秒，只返回该时间之后的；`keep` 按路径筛选范围。
+    pub fn recent(&self, since: Option<i64>, limit: usize, keep: impl Fn(&str) -> bool) -> (Vec<ChangeEntry>, bool) {
         let mut out = Vec::new();
         let total = self.len;
         for i in 0..total {
             // 从最新往回走。
             let idx = (self.next + self.cap - 1 - i) % self.entries.len().max(1);
             let e = &self.entries[idx];
-            if since.is_some_and(|s| e.timestamp < s) {
+            if since.is_some_and(|s| e.timestamp < s) || !keep(&e.path) {
                 continue;
             }
             if out.len() >= limit {
@@ -61,6 +61,7 @@ impl RecentLog {
         (out, false)
     }
 
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.len
     }
@@ -85,7 +86,7 @@ mod tests {
             log.push(entry(&format!(r"C:\f{i}.txt"), i), &deny);
         }
         assert_eq!(log.len(), 3);
-        let (recent, _) = log.recent(None, 10);
+        let (recent, _) = log.recent(None, 10, |_| true);
         let paths: Vec<_> = recent.iter().map(|e| e.path.as_str()).collect();
         assert_eq!(paths, vec![r"C:\f4.txt", r"C:\f3.txt", r"C:\f2.txt"]);
     }
@@ -97,7 +98,7 @@ mod tests {
         for i in 0..5 {
             log.push(entry(&format!(r"C:\f{i}.txt"), i * 100), &deny);
         }
-        let (recent, truncated) = log.recent(Some(200), 1);
+        let (recent, truncated) = log.recent(Some(200), 1, |_| true);
         assert_eq!(recent.len(), 1);
         assert!(truncated);
         assert_eq!(recent[0].timestamp, 400);
