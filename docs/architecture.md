@@ -98,3 +98,6 @@ QuerySpec ─compile→ CompiledQuery ─┬─ 遍历节点（rayon 并行，�
 
 M1 核心索引 + 假卷 → M2 NTFS 枚举 → M3 USN 增量 + 快照 → M4 拼音 + 查询 → M5 项目层 → M6 IPC + 服务 → M7 MCP + 接入 + 安装包。
 每个里程碑的任务卡见 `docs/tasks/`。
+
+第二阶段：M8 服务内增量 + 快照 + recent_changes → M9 SCM 生命周期 + 安装包 → M10 元数据与查询过滤 →
+M11 内容搜索（先定权限模型）。
