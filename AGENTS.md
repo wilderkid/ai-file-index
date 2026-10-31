@@ -23,7 +23,7 @@ Windows 本地**文件名**索引服务 + MCP 服务器，供 Claude Code / Code
 | aifi-harness | core | 真实磁盘 |
 | aifi-ntfs | core, windows | 写卷、创建/删除 USN 日志 |
 | aifi-service | 以上全部 | 网络、执行外部命令、写用户文件 |
-| aifi-mcp | protocol, project, rmcp, tokio, regex | 网络、提权、写盘；读文件内容只能在 `content` 模块里以调用者身份进行 |
+| aifi-mcp | protocol, project, rmcp, tokio, regex, encoding_rs, miniz_oxide | 网络、提权、写盘；读文件内容只能在 `content` 模块里以调用者身份进行 |
 
 新增依赖前先在 PR 描述里说明理由，并确认版本在 crates.io 上真实存在。
 

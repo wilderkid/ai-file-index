@@ -65,6 +65,7 @@ windows = "0.62.2"
 windows-service = "0.8.1"
 tempfile = "3.27.0"
 encoding_rs = "0.8.44"
+miniz_oxide = "0.9.1"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

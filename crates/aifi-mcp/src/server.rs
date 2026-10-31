@@ -100,8 +100,8 @@ async fn search_content(args: serde_json::Value) -> Result<CallToolResponse, Mcp
         include_ignored: p.include_ignored,
         limit: Some(aifi_protocol::MAX_LIMIT),
         under: p.under.clone(),
-        // 只要大小已知且不超过单文件上限的：其余的读了也会被跳过。
-        max_size: Some(content::MAX_FILE_BYTES),
+        // 超过最大单文件上限的读了也会被跳过；文本文件的 1 MiB 上限由 `read_file` 按扩展名再查。
+        max_size: Some(content::MAX_OFFICE_BYTES),
         // 没有 `under` 时必须在项目里，不允许退回整盘。
         require_project: true,
         ..Default::default()

@@ -12,8 +12,15 @@ use aifi_project::Denylist;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-/// 单个文件最多读这么多字节，更大的跳过。
+/// 单个文本文件最多读这么多字节，更大的跳过。
 pub const MAX_FILE_BYTES: u64 = 1024 * 1024;
+/// docx / xlsx / pptx 是压缩包，常带图片，单文件上限放宽。解压另有上限（见 `office`）。
+pub const MAX_OFFICE_BYTES: u64 = 16 * 1024 * 1024;
+
+/// 一个路径适用的单文件读取上限。
+pub fn size_limit(path: &str) -> u64 {
+    if crate::office::Kind::from_path(path).is_some() { MAX_OFFICE_BYTES } else { MAX_FILE_BYTES }
+}
 /// 一次调用最多读这么多字节。
 pub const MAX_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
 /// 最多检查这么多个候选文件。
@@ -67,9 +74,12 @@ impl SearchContentParams {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ContentMatch {
     pub path: String,
-    /// 从 1 开始的行号。
+    /// 从 1 开始的行号；Office 文档里是第几段 / 第几行文字。
     pub line: usize,
-    /// 匹配行（去掉首尾空白，过长时截取匹配附近）。
+    /// Office 文档里的位置，例如 `报价!12`（工作表!行）、`slide 3`。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub location: Option<String>,
+    /// 匹配行（去掉首尾空白，过长时截取匹配附近，已脱敏）。
     pub text: String,
 }
 
@@ -86,6 +96,8 @@ pub enum Skip {
     CloudPlaceholder,
     /// 打不开或读失败（通常是没有权限）。
     Unreadable,
+    /// Office 文档损坏、加密或用了不支持的压缩方式。
+    Unsupported,
 }
 
 /// 一次扫描的结果。
@@ -215,9 +227,25 @@ pub fn scan(
             }
         };
         total += bytes.len() as u64;
-        let Some(text) = decode(&bytes) else {
-            *r.skipped.entry(Skip::Binary).or_default() += 1;
-            continue;
+        let (text, labels) = match crate::office::Kind::from_path(path) {
+            Some(kind) => match crate::office::extract(kind, &bytes) {
+                Some(doc) => {
+                    // 压缩包读进来的字节远小于解压后的文字，预算按文字算，否则几个大表格就能绕过总上限。
+                    total += doc.text.len() as u64;
+                    (doc.text, doc.labels)
+                }
+                None => {
+                    *r.skipped.entry(Skip::Unsupported).or_default() += 1;
+                    continue;
+                }
+            },
+            None => match decode(&bytes) {
+                Some(t) => (t, Vec::new()),
+                None => {
+                    *r.skipped.entry(Skip::Binary).or_default() += 1;
+                    continue;
+                }
+            },
         };
         r.files_scanned += 1;
         let room = (limit - r.matches.len()).min(PER_FILE_MATCHES);
@@ -225,7 +253,12 @@ pub fn scan(
         if !lines.is_empty() {
             r.files_with_matches += 1;
         }
-        r.matches.extend(lines.into_iter().map(|(line, text)| ContentMatch { path: path.clone(), line, text }));
+        r.matches.extend(lines.into_iter().map(|(line, text)| ContentMatch {
+            path: path.clone(),
+            line,
+            location: labels.get(line - 1).filter(|l| !l.is_empty()).cloned(),
+            text,
+        }));
     }
     r
 }
@@ -266,12 +299,13 @@ pub fn read_file(path: &str) -> Result<Vec<u8>, Skip> {
     if !meta.is_file() {
         return Err(Skip::Unreadable);
     }
-    if meta.len() > MAX_FILE_BYTES {
+    let cap = size_limit(path);
+    if meta.len() > cap {
         return Err(Skip::TooLarge);
     }
     let mut buf = Vec::with_capacity(meta.len() as usize);
-    file.take(MAX_FILE_BYTES + 1).read_to_end(&mut buf).map_err(|_| Skip::Unreadable)?;
-    if buf.len() as u64 > MAX_FILE_BYTES {
+    file.take(cap + 1).read_to_end(&mut buf).map_err(|_| Skip::Unreadable)?;
+    if buf.len() as u64 > cap {
         return Err(Skip::TooLarge);
     }
     Ok(buf)
@@ -291,7 +325,10 @@ pub fn render(r: &ContentReport) -> String {
     }
     out.push('\n');
     for m in &r.matches {
-        out.push_str(&format!("{}:{}: {}\n", m.path, m.line, m.text));
+        match &m.location {
+            Some(loc) => out.push_str(&format!("{} [{loc}]: {}\n", m.path, m.text)),
+            None => out.push_str(&format!("{}:{}: {}\n", m.path, m.line, m.text)),
+        }
     }
     for n in &r.notes {
         out.push_str(&format!("({n})\n"));
@@ -416,6 +453,48 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("c:1: x marks\n"));
+    }
+
+    #[test]
+    fn office_files_are_extracted_located_and_redacted() {
+        // 最小 xlsx：一张表，A1 写着客户号，B2 写着密码。
+        let sheet = r#"<worksheet><sheetData><row r="1"><c t="inlineStr"><is><t>客户 ACME1234</t></is></c></row><row r="2"><c t="inlineStr"><is><t>password=hunter2 ACME</t></is></c></row></sheetData></worksheet>"#;
+        let mut z = Vec::new();
+        let name = b"xl/worksheets/sheet1.xml";
+        z.extend(0x0403_4B50u32.to_le_bytes());
+        z.extend([20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        z.extend((sheet.len() as u32).to_le_bytes());
+        z.extend((sheet.len() as u32).to_le_bytes());
+        z.extend((name.len() as u16).to_le_bytes());
+        z.extend([0, 0]);
+        z.extend(name);
+        z.extend(sheet.as_bytes());
+        let cd_off = z.len() as u32;
+        let mut cd = Vec::new();
+        cd.extend(0x0201_4B50u32.to_le_bytes());
+        cd.extend([20, 0, 20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        cd.extend((sheet.len() as u32).to_le_bytes());
+        cd.extend((sheet.len() as u32).to_le_bytes());
+        cd.extend((name.len() as u16).to_le_bytes());
+        cd.extend([0; 12]);
+        cd.extend(0u32.to_le_bytes());
+        cd.extend(name);
+        z.extend(&cd);
+        z.extend(0x0605_4B50u32.to_le_bytes());
+        z.extend([0, 0, 0, 0, 1, 0, 1, 0]);
+        z.extend((cd.len() as u32).to_le_bytes());
+        z.extend(cd_off.to_le_bytes());
+        z.extend([0, 0]);
+
+        let deny = Denylist::with_defaults();
+        let paths = vec![r"E:\客户\报价.xlsx".to_string(), r"E:\客户\坏的.docx".to_string()];
+        let r = scan(&paths, &matcher("acme", false, false), 10, &deny, far_future(), &mut |p| {
+            Ok(if p.ends_with(".xlsx") { z.clone() } else { b"PK not really".to_vec() })
+        });
+        let got: Vec<_> = r.matches.iter().map(|m| (m.location.as_deref(), m.text.as_str())).collect();
+        assert_eq!(got, vec![(Some("sheet1!1"), "客户 ACME1234"), (Some("sheet1!2"), "password=*** ACME")]);
+        assert_eq!(r.skipped.get(&Skip::Unsupported), Some(&1));
+        assert!(render(&r).contains("E:\\客户\\报价.xlsx [sheet1!1]: 客户 ACME1234\n"));
     }
 
     #[test]

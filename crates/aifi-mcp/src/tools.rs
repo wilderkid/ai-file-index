@@ -67,7 +67,7 @@ pub fn tool_definitions() -> Vec<ToolDef> {
             description: "Search inside text files for a literal string (or regex=true) and return matching lines as \
                 path:line: text. Requires `under` (a directory) or a `cwd` inside a project; narrow further with `query` \
                 (file name, e.g. '*.md') or `extensions`. Reads files as the current user, so files you cannot open are \
-                skipped. Handles UTF-8, UTF-16 and GBK text; skips binaries, files over 1 MB, links and cloud-only files. \
+                skipped. Handles UTF-8, UTF-16 and GBK text; also searches text inside .docx/.xlsx/.pptx (results show sheet!row or slide). Skips other binaries, text files over 1 MB, links and cloud-only files. Secret-looking values in results are masked. \
                 Use find_files for file names; use this only when you need what is inside the files.",
             input_schema: schema_of::<crate::content::SearchContentParams>(),
         },

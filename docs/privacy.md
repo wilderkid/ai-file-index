@@ -42,6 +42,7 @@ Chrome / Edge / Brave 的 `User Data`、Firefox `Profiles`、1Password、Bitward
   `search_content` 也读不到，静默跳过。服务（SYSTEM）从不替调用方读内容。
 - **读哪些文件**：候选集由服务按文件名索引给出（已过黑名单），`aifi-mcp` 读之前再用 `Denylist::is_denied` 检查一次。
   必须给出 `under` 或位于项目内的 `cwd`，不支持整盘逐个读文件。
+- **格式**：纯文本（UTF-8 / UTF-16 / GBK）与 docx / xlsx / pptx（只取文字，带解压上限防 zip 炸弹）。
 - **跳过**：符号链接与其他重解析点、云端占位文件（OneDrive 等"按需下载"文件，读取会触发下载）、
   含 NUL 字节的二进制文件、超过大小上限的文件。
 - **上限**：单文件、总读取字节、候选数、匹配数、总耗时都有上限，见 `crates/aifi-mcp/src/content.rs`。
