@@ -49,7 +49,7 @@ async fn list_tools_and_call_find_files() {
                 got.push_str(&line);
                 got.push('\n');
                 if line.contains("\"id\":2") {
-                    saw_tools = line.matches("\"name\"").count() >= 5;
+                    saw_tools = line.matches("\"name\"").count() >= 6 && line.contains("search_content");
                 }
                 if line.contains("\"id\":3") {
                     // 服务未运行时报错，运行时返回真实命中。两种都说明调用走通了。
@@ -59,9 +59,8 @@ async fn list_tools_and_call_find_files() {
             _ => break,
         }
     }
-    assert!(saw_tools, "tools/list 未返回 5 个工具，收到:\n{got}");
+    assert!(saw_tools, "tools/list 未返回 6 个工具，收到:\n{got}");
     assert!(saw_error, "tools/call 没有返回结果，收到:\n{got}");
-    assert!(saw_tools, "tools/list 应返回 5 个工具");
     assert!(saw_error, "服务未运行时应返回包含启动提示的错误");
     server.abort();
 }

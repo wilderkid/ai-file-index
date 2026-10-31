@@ -26,6 +26,7 @@ pub const LIST_PROJECT_TREE: &str = "list_project_tree";
 pub const LIST_PROJECTS: &str = "list_projects";
 pub const RECENT_CHANGES: &str = "recent_changes";
 pub const INDEX_STATUS: &str = "index_status";
+pub const SEARCH_CONTENT: &str = "search_content";
 
 /// 全部工具。顺序即 `tools/list` 的返回顺序。
 pub fn tool_definitions() -> Vec<ToolDef> {
@@ -61,12 +62,22 @@ pub fn tool_definitions() -> Vec<ToolDef> {
             description: "Report index health: volumes, entry counts, readiness, protocol version and capabilities.",
             input_schema: schema_of::<IndexStatusParams>(),
         },
+        ToolDef {
+            name: SEARCH_CONTENT,
+            description: "Search inside text files for a literal string (or regex=true) and return matching lines as \
+                path:line: text. Requires `under` (a directory) or a `cwd` inside a project; narrow further with `query` \
+                (file name, e.g. '*.md') or `extensions`. Reads files as the current user, so files you cannot open are \
+                skipped. Handles UTF-8, UTF-16 and GBK text; skips binaries, files over 1 MB, links and cloud-only files. \
+                Use find_files for file names; use this only when you need what is inside the files.",
+            input_schema: schema_of::<crate::content::SearchContentParams>(),
+        },
     ]
 }
 
 /// 写进 MCP `instructions` 字段的使用说明（同时抄在 AGENTS.md / CLAUDE.md 里）。
 pub const INSTRUCTIONS: &str = "ai-file-index: instant local filename search on Windows. \
 Always pass your current working directory as `cwd`. Use find_files before listing directories recursively. \
+Use search_content (with `under` or a project `cwd`) only when you need text inside files. \
 Results never include secrets (.ssh, .env, keys, browser profiles) by design. Read-only: this server cannot modify files.";
 
 #[cfg(test)]
@@ -74,10 +85,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn five_tools_with_object_schemas() {
+    fn six_tools_with_object_schemas() {
         let tools = tool_definitions();
         let names: Vec<_> = tools.iter().map(|t| t.name).collect();
-        assert_eq!(names, [FIND_FILES, LIST_PROJECT_TREE, LIST_PROJECTS, RECENT_CHANGES, INDEX_STATUS]);
+        assert_eq!(names, [FIND_FILES, LIST_PROJECT_TREE, LIST_PROJECTS, RECENT_CHANGES, INDEX_STATUS, SEARCH_CONTENT]);
         for t in &tools {
             assert_eq!(t.input_schema.get("type"), Some(&Value::from("object")), "{}", t.name);
         }

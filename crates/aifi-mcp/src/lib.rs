@@ -1,5 +1,6 @@
 //! MCP 服务器的库接口，供端到端测试构造一个不依赖命名管道的实例。
 
+pub mod content;
 pub mod convert;
 pub mod ipc_client;
 pub mod server;

@@ -9,3 +9,6 @@
 /logs
 .env
 .env.*
+
+# wix extension cache created by `wix extension add`
+.wix/
