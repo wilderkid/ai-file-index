@@ -110,6 +110,9 @@ pub struct FindFilesParams {
     pub modified_before: Option<i64>,
     #[serde(default)]
     pub sort: SortBy,
+    /// `scope=project` 且 `cwd` 不在任何项目里时：`false`（默认）退回整盘；`true` 返回 `InvalidParams`。
+    #[serde(default)]
+    pub require_project: bool,
 }
 
 /// `list_project_tree` 参数。

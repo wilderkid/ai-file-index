@@ -100,7 +100,26 @@ impl<'a> Handler<'a> {
             None => vec![Some(Scan::Volume); refs.len()],
         };
         let current = p.cwd.as_deref().and_then(|c| self.projects.resolve(c)).map(|proj| proj.root.clone());
-        let tier = |path: &str| aifi_project::rank_tier(path, current.as_deref(), &self.projects.roots(), None);
+        let project_scope = p.under.is_none() && p.scope == aifi_protocol::Scope::Project;
+        if project_scope && current.is_none() && p.require_project {
+            return Response::Error {
+                code: ErrorCode::InvalidParams,
+                message: "`cwd` is not inside a known project".into(),
+            };
+        }
+        // 当前项目范围：只扫描项目根的子树，而不是扫全卷再按分层丢弃。全卷扫描要为每个命中拼路径，
+        // `*` 这类宽查询在百万级条目上要几秒。
+        let scans = match current.as_deref() {
+            Some(root) if project_scope => {
+                let sub = resolve_under(&refs, root);
+                // 项目根理论上一定在索引里；万一查不到，退回原来的全卷扫描 + 分层过滤，结果仍然正确。
+                if sub.iter().any(Option::is_some) { sub } else { scans }
+            }
+            _ => scans,
+        };
+        // 闭包对每条命中都会调用：项目根集合在外面建好一次，查询与根的数量无关。
+        let roots = aifi_project::ProjectRoots::new(self.projects.roots());
+        let tier = |path: &str| aifi_project::rank_tier_in(path, current.as_deref(), &roots, None);
         // 请求项目范围但没有 cwd（或 cwd 不在任何项目里）时，退回全盘并在结果里说明。
         let (max_tier, effective_scope) = match p.scope {
             _ if p.under.is_some() => (aifi_project::RankTier::Other, aifi_protocol::Scope::Disk),
@@ -325,6 +344,37 @@ mod tests {
         }
         match find(r"C:\Users\me\.ssh") {
             Response::Error { code, .. } => assert_eq!(code, ErrorCode::Denied),
+            r => panic!("{r:?}"),
+        }
+    }
+
+    #[test]
+    fn project_scope_scans_the_project_and_can_refuse_fallback() {
+        let (slot, projects, deny) = setup();
+        let slots = [&slot];
+        let h = Handler::new(&slots, &projects, &deny);
+        let find = |cwd: &str, require_project: bool| {
+            h.handle(Request::FindFiles(aifi_protocol::FindFilesParams {
+                query: "*".into(),
+                cwd: Some(cwd.into()),
+                require_project,
+                ..Default::default()
+            }))
+        };
+        match find(r"C:\src\aifi\src", true) {
+            Response::FindFiles(r) => {
+                assert_eq!(r.effective_scope, aifi_protocol::Scope::Project);
+                assert!(!r.hits.is_empty());
+                assert!(r.hits.iter().all(|hit| hit.path.starts_with(r"C:\src\aifi\")), "{:?}", r.hits);
+            }
+            r => panic!("{r:?}"),
+        }
+        match find(r"C:\Users\me\Documents", true) {
+            Response::Error { code, .. } => assert_eq!(code, ErrorCode::InvalidParams),
+            r => panic!("{r:?}"),
+        }
+        match find(r"C:\Users\me\Documents", false) {
+            Response::FindFiles(r) => assert_eq!(r.effective_scope, aifi_protocol::Scope::Disk, "默认仍退回整盘"),
             r => panic!("{r:?}"),
         }
     }
