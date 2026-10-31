@@ -115,6 +115,56 @@ pub enum RankTier {
     Other = 3,
 }
 
+/// 一组项目根，按祖先目录查哈希表判断"路径是否在某个项目里"。
+///
+/// [`rank_tier`] 对每个根调用一次 [`is_within`]：机器上有上千个项目时，宽查询的每条命中都要比较上千次
+/// （实测 200 万条命中 × 1000 个根约 15 s）。这里换成对路径的每一级祖先查一次集合，与根的数量无关。
+/// 语义与 `is_within` 一致：按组件、ASCII 大小写不敏感，路径等于根本身也算在内。
+#[derive(Debug, Default, Clone)]
+pub struct ProjectRoots {
+    roots: std::collections::HashSet<String>,
+}
+
+impl ProjectRoots {
+    pub fn new<'a>(roots: impl IntoIterator<Item = &'a str>) -> Self {
+        Self { roots: roots.into_iter().map(normalize).collect() }
+    }
+
+    /// `path` 是否位于任一项目根之内。
+    pub fn contains(&self, path: &str) -> bool {
+        if self.roots.is_empty() {
+            return false;
+        }
+        let p = normalize(path);
+        p.match_indices('\\').map(|(i, _)| &p[..i]).chain(std::iter::once(p.as_str())).any(|a| self.roots.contains(a))
+    }
+}
+
+/// 组件用 `\` 连接、ASCII 小写，去掉空组件（与 [`components`] 一致）。
+fn normalize(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    for (i, c) in components(path).enumerate() {
+        if i > 0 {
+            out.push('\\');
+        }
+        out.extend(c.chars().map(|ch| ch.to_ascii_lowercase()));
+    }
+    out
+}
+
+/// 同 [`rank_tier`]，但用 [`ProjectRoots`] 判断"其他项目"。
+pub fn rank_tier_in(path: &str, current: Option<&str>, projects: &ProjectRoots, user_home: Option<&str>) -> RankTier {
+    if current.is_some_and(|c| is_within(path, c)) {
+        RankTier::CurrentProject
+    } else if projects.contains(path) {
+        RankTier::OtherProject
+    } else if user_home.is_some_and(|h| is_within(path, h)) {
+        RankTier::UserDir
+    } else {
+        RankTier::Other
+    }
+}
+
 /// 计算一个路径的排序分层。
 pub fn rank_tier(path: &str, current: Option<&str>, projects: &[&str], user_home: Option<&str>) -> RankTier {
     if current.is_some_and(|c| is_within(path, c)) {
@@ -175,6 +225,29 @@ mod tests {
         m.insert(r"C:\src\mono\packages\web", vec!["package.json".into(), "src".into()]);
         m.insert(r"C:\src\dotnet", vec!["App.SLN".into()]);
         m
+    }
+
+    #[test]
+    fn project_roots_agree_with_is_within() {
+        let roots = [r"C:\src\mono", r"D:\work\App\", r"e:/Share/ACME1234"];
+        let set = ProjectRoots::new(roots);
+        let paths = [
+            r"C:\src\mono",
+            r"c:\SRC\Mono\packages\web\a.ts",
+            r"C:\src\monorepo\x",
+            r"C:\src",
+            r"D:\work\app\bin\x.dll",
+            r"D:\work",
+            r"E:\share\acme1234\报价.xlsx",
+            r"E:\share\acme12340",
+            r"F:\other",
+        ];
+        for p in paths {
+            let expected = roots.iter().any(|r| is_within(p, r));
+            assert_eq!(set.contains(p), expected, "{p}");
+            assert_eq!(rank_tier_in(p, None, &set, None), rank_tier(p, None, &roots, None), "{p}");
+        }
+        assert!(!ProjectRoots::default().contains(r"C:\a"));
     }
 
     #[test]

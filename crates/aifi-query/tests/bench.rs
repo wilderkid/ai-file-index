@@ -57,5 +57,16 @@ fn two_million_entries() {
     let (mp50, mp99, mn) = time(&idx, &whole, &sized, 10);
     eprintln!("size filter + sort by modified, whole volume: p50 {mp50:?} p99 {mp99:?} ({mn} hits)");
 
+    // 服务端的真实分层：1000 个项目根，每条命中都要和它们逐个比较。
+    let roots: Vec<String> = (0..1000).map(|i| format!(r"C:\proj{i}")).collect();
+    let set = aifi_project::ProjectRoots::new(roots.iter().map(String::as_str));
+    let deny = Denylist::with_defaults();
+    let tier = |p: &str| aifi_project::rank_tier_in(p, None, &set, None);
+    let ctx = QueryContext { denylist: &deny, tier: &tier, max_tier: RankTier::Other, gitignored: None };
+    let q = CompiledQuery::compile(QuerySpec { text: "*".into(), ..Default::default() }).unwrap();
+    let t = Instant::now();
+    let page = search_scoped(&[&idx], &whole, &q, &ctx, 1000, None);
+    eprintln!("'*' with 1000 project roots, whole volume: {:?} ({} hits)", t.elapsed(), page.total);
+
     assert!(sp50 < p50, "subtree scan should be faster than a whole-volume scan");
 }
