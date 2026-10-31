@@ -46,7 +46,9 @@ Chrome / Edge / Brave 的 `User Data`、Firefox `Profiles`、1Password、Bitward
   含 NUL 字节的二进制文件、超过大小上限的文件。
 - **上限**：单文件、总读取字节、候选数、匹配数、总耗时都有上限，见 `crates/aifi-mcp/src/content.rs`。
 - **不留存**：内容不发给服务，不进索引、快照或日志；只有命中行的截断片段返回给 AI 客户端。
-- **已知限制**：返回给 AI 的片段可能包含普通文件里的敏感文本（例如配置文件中的密码）。黑名单只覆盖已知的密钥文件类型。
+- **片段脱敏（不可关闭）**：返回前把像密码、令牌、私钥的值换成 `***`：`password=`、`api_key:`、`密码：` 等键后面的值，
+  `scheme://user:pass@` 里的口令，`Bearer` 令牌，AWS / GitHub / `sk-` / Slack / JWT 格式，以及大小写数字混合的长 base64 串。
+  规则宁可多遮；它是兜底，不保证识别所有写法，见 `crates/aifi-mcp/src/redact.rs`。
 
 ## 文件名层面的已知限制
 

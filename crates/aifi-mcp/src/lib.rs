@@ -3,6 +3,7 @@
 pub mod content;
 pub mod convert;
 pub mod ipc_client;
+pub mod redact;
 pub mod server;
 pub mod tools;
 

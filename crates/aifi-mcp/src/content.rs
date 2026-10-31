@@ -152,7 +152,8 @@ fn find_lines(text: &str, m: &Matcher, cap: usize) -> Vec<(usize, String)> {
     let mut out = Vec::new();
     for (i, line) in text.lines().enumerate() {
         if let Some(hit) = m.0.find(line) {
-            out.push((i + 1, snippet(line, hit.start())));
+            // 先截片段再脱敏：脱敏会改变长度，截取位置要按原文的匹配位置算。
+            out.push((i + 1, crate::redact::redact(&snippet(line, hit.start())).into_owned()));
             if out.len() >= cap {
                 break;
             }
@@ -332,6 +333,16 @@ mod tests {
         assert_eq!(find_lines("客户 acme1234 订单", &m, 10).len(), 1);
         assert!(Matcher::new(&SearchContentParams { pattern: "(".into(), regex: true, ..Default::default() }).is_err());
         assert!(Matcher::new(&SearchContentParams { pattern: "\n".into(), ..Default::default() }).is_err());
+    }
+
+    #[test]
+    fn matched_lines_are_redacted() {
+        let m = matcher("db", false, false);
+        let got = find_lines("db_host = 10.0.0.5\ndb_password = hunter2\n", &m, 10);
+        assert_eq!(got, vec![(1, "db_host = 10.0.0.5".into()), (2, "db_password = ***".into())]);
+        // 搜索词本身就是密码时也不会把它还给调用方。
+        let m = matcher("hunter2", false, false);
+        assert_eq!(find_lines("password=hunter2", &m, 10), vec![(1, "password=***".into())]);
     }
 
     #[test]
